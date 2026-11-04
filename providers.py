@@ -188,6 +188,12 @@ class OllamaProvider(BaseProvider):
         self.base_url = (
             base_url or os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         ).rstrip("/")
+        # Ollama's default context (4096 tokens) silently truncates the
+        # debate-phase prompt (race data + every AI's prediction), which
+        # made the local model ramble to its token cap and hit the read
+        # timeout (Monbetsu 12R dry run, 2026-11-05). Ask for a context
+        # that actually fits the prompts; OLLAMA_NUM_CTX overrides.
+        self.num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
 
     def chat(self, system, user, model=None, max_tokens=None):
         use_model = model or self.model
@@ -206,7 +212,7 @@ class OllamaProvider(BaseProvider):
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    "options": {"num_predict": budget},
+                    "options": {"num_predict": budget, "num_ctx": self.num_ctx},
                 },
                 timeout=600,
             )
@@ -244,7 +250,11 @@ class OllamaProvider(BaseProvider):
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    "options": {"num_predict": budget, "temperature": 0.4},
+                    "options": {
+                        "num_predict": budget,
+                        "temperature": 0.4,
+                        "num_ctx": self.num_ctx,
+                    },
                 },
                 timeout=900,
             )

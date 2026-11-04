@@ -978,6 +978,21 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             for p, _ in built
             if p["username"] != username
         )
+        # The local model generates slowly and its context is precious:
+        # for the structured persona, trim the debate prompt (shorter
+        # form lines, other predictions excerpted) and cap the reply
+        # budget. Cloud personas keep the full context. (The untrimmed
+        # prompt plus a 4096-token context made the local debate call
+        # hit its 600s timeout in the 2026-11-05 Monbetsu 12R dry run.)
+        prompt_body, prompt_others, chat_budget = body, others, None
+        if persona.get("structured"):
+            prompt_body = race_text(fixture, form_limit=3)
+            prompt_others = "\n\n".join(
+                f"--- {p['display']} の予想 ---\n{predictions[p['username']][:500]}"
+                for p, _ in built
+                if p["username"] != username
+            )
+            chat_budget = 2500
         system = SYSTEM_TEMPLATE.format(display=persona["display"])
         user = (
             "他のAIの予想が出そろいました。元の出走データと各AIの予想を踏まえて、"
@@ -986,10 +1001,10 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             "最後に、議論を踏まえたあなたの最終票を必ず次の形式で書いてください"
             "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にしてください）:\n"
             "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
-            f"【元の出走データ】\n{body}\n\n"
-            f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{others}"
+            f"【元の出走データ】\n{prompt_body}\n\n"
+            f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{prompt_others}"
         )
-        text = prov.chat(system, user)
+        text = prov.chat(system, user, max_tokens=chat_budget)
         if not text.strip():
             raise RuntimeError(f"empty debate reply from {username}")
         debate[username] = text
@@ -998,7 +1013,7 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                 "次のレースについて、他のAIとの議論を踏まえた最終票をJSONで出してください。\n\n"
                 f"【元の出走データ】\n{race_text(fixture, form_limit=3)}\n\n"
                 f"【自分の予想】\n{predictions[username]}\n\n"
-                f"【他のAIの予想】\n{others}\n\n【自分の議論】\n{text}"
+                f"【他のAIの予想（抜粋）】\n{prompt_others}\n\n【自分の議論】\n{text[:800]}"
             )
             ballot = generate_structured_ballot(prov, fixture, context)
             final_marks[username] = ballot

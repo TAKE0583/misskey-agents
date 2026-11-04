@@ -1,0 +1,178 @@
+{
+  "race_id": "202630110412",
+  "race": "第1回 道営スプリント〔H1〕(ソウルラッシュ賞重賞（条件）",
+  "date": "2026-11-04",
+  "venue": "門別競馬場",
+  "winning_time": "1:13.1",
+  "race_summary": "",
+  "finish": [
+    {
+      "position": 1,
+      "number": 10,
+      "name": "ストリーム",
+      "popularity": 2,
+      "time": "1:13.1",
+      "margin": "",
+      "win_odds": 2.9
+    },
+    {
+      "position": 2,
+      "number": 6,
+      "name": "リプレゼント",
+      "popularity": 1,
+      "time": "1:13.1",
+      "margin": "クビ",
+      "win_odds": 2.6
+    },
+    {
+      "position": 3,
+      "number": 13,
+      "name": "ヤマニンパッセ",
+      "popularity": 8,
+      "time": "1:13.7",
+      "margin": "3",
+      "win_odds": 31.1
+    },
+    {
+      "position": 4,
+      "number": 11,
+      "name": "ポリッキー",
+      "popularity": 9,
+      "time": "1:13.9",
+      "margin": "1",
+      "win_odds": 59.0
+    },
+    {
+      "position": 5,
+      "number": 2,
+      "name": "ボイラーハウス",
+      "popularity": 5,
+      "time": "1:14.1",
+      "margin": "3/4",
+      "win_odds": 11.5
+    },
+    {
+      "position": 6,
+      "number": 8,
+      "name": "ラッキーホープ",
+      "popularity": 3,
+      "time": "1:14.1",
+      "margin": "クビ",
+      "win_odds": 7.6
+    },
+    {
+      "position": 7,
+      "number": 14,
+      "name": "ドウドウキリシマ",
+      "popularity": 11,
+      "time": "1:14.1",
+      "margin": "ハナ",
+      "win_odds": 189.5
+    },
+    {
+      "position": 8,
+      "number": 3,
+      "name": "スティールペガサス",
+      "popularity": 6,
+      "time": "1:14.3",
+      "margin": "1",
+      "win_odds": 14.1
+    },
+    {
+      "position": 9,
+      "number": 7,
+      "name": "ケイアイドリー",
+      "popularity": 7,
+      "time": "1:14.4",
+      "margin": "1/2",
+      "win_odds": 19.8
+    },
+    {
+      "position": 10,
+      "number": 5,
+      "name": "サンヨウテイオウ",
+      "popularity": 14,
+      "time": "1:14.6",
+      "margin": "1",
+      "win_odds": 640.6
+    },
+    {
+      "position": 11,
+      "number": 12,
+      "name": "デステージョ",
+      "popularity": 4,
+      "time": "1:14.9",
+      "margin": "1.1/2",
+      "win_odds": 7.7
+    },
+    {
+      "position": 12,
+      "number": 1,
+      "name": "ファインキック",
+      "popularity": 12,
+      "time": "1:14.9",
+      "margin": "アタマ",
+      "win_odds": 206.2
+    },
+    {
+      "position": 13,
+      "number": 9,
+      "name": "トモノシルバー",
+      "popularity": 13,
+      "time": "1:15.2",
+      "margin": "1.1/2",
+      "win_odds": 394.3
+    },
+    {
+      "position": 14,
+      "number": 15,
+      "name": "ラグナキリア",
+      "popularity": 15,
+      "time": "1:15.6",
+      "margin": "2",
+      "win_odds": 791.9
+    },
+    {
+      "position": 15,
+      "number": 4,
+      "name": "ヒマラヤベロス",
+      "popularity": 10,
+      "time": "1:15.6",
+      "margin": "クビ",
+      "win_odds": 162.3
+    }
+  ],
+  "payouts_jpy": {
+    "win": {
+      "10": 290
+    },
+    "place": {
+      "10": 140,
+      "6": 140,
+      "13": 560
+    },
+    "bracket": {
+      "4-6": 420
+    },
+    "quinella": {
+      "6-10": 410
+    },
+    "wide": {
+      "6-10": 200,
+      "10-13": 1090,
+      "6-13": 1380
+    },
+    "exacta": {
+      "10-6": 840
+    },
+    "trio": {
+      "6-10-13": 3780
+    },
+    "trifecta": {
+      "10-6-13": 13110
+    }
+  },
+  "sources": [
+    "netkeiba race_id=202630110412 (keiba-scraping)"
+  ]
+}
