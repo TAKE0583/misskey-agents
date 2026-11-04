@@ -73,9 +73,9 @@ check("bet lines: unparseable line is an error", errs != [])
 
 # --- prediction_errors end to end ---
 text_ok = (
-    "◎ 10 タイムエッジ — 本命。\n○ 4 ダムドローズ — 対抗。\n"
-    "▲ 1 エリオラ — 単穴。\n△ 2 ラップドアップ — 連下。\n\n"
-    "【買い目（予算1,000円）】\n単勝 10 400円\n3連複 1-4-10 600円"
+    "◎ 10 タイムエッジ 勝率30% 3着内60% — 本命。\n○ 4 ダムドローズ 勝率22% 3着内50% — 対抗。\n"
+    "▲ 1 エリオラ 勝率15% 3着内40% — 単穴。\n△ 2 ラップドアップ 勝率10% 3着内30% — 連下。\n\n"
+    "【買い目】\n単勝 10 400点\n3連複 1-4-10 600点"
 )
 check("prediction: valid text passes", o.prediction_errors(text_ok, monbetsu) == [])
 text_99 = text_ok.replace("10 タイムエッジ", "99 ゴースト").replace("単勝 10", "単勝 99").replace("1-4-10", "1-4-99")
@@ -165,10 +165,10 @@ class StubJSON:
         if self.always_bad or self.calls == 1:
             return {"marks": [{"mark": m, "number": 99, "reason": "x"} for m in ("◎", "○", "▲", "△")],
                     "bets": [{"type": "単勝", "combo": "99", "amount": 1000}], "comment": ""}
-        return {"marks": [{"mark": "◎", "number": 10, "reason": "本命"},
-                          {"mark": "○", "number": 4, "reason": "対抗"},
-                          {"mark": "▲", "number": 1, "reason": "単穴"},
-                          {"mark": "△", "number": 2, "reason": "連下"}],
+        return {"marks": [{"mark": "◎", "number": 10, "win_pct": 30, "top3_pct": 60, "reason": "本命"},
+                          {"mark": "○", "number": 4, "win_pct": 22, "top3_pct": 50, "reason": "対抗"},
+                          {"mark": "▲", "number": 1, "win_pct": 15, "top3_pct": 40, "reason": "単穴"},
+                          {"mark": "△", "number": 2, "win_pct": 10, "top3_pct": 30, "reason": "連下"}],
                 "bets": [{"type": "単勝", "combo": "10", "amount": 1000}], "comment": ""}
 
 
@@ -213,10 +213,10 @@ class _StructuredStub:
 
     def chat_json(self, system, user, schema, model=None, max_tokens=None):
         if "bets" in (schema.get("required") or []):
-            return {"marks": [{"mark": "◎", "number": 10, "reason": "本命"},
-                              {"mark": "○", "number": 4, "reason": "対抗"},
-                              {"mark": "▲", "number": 1, "reason": "単穴"},
-                              {"mark": "△", "number": 2, "reason": "連下"}],
+            return {"marks": [{"mark": "◎", "number": 10, "win_pct": 30, "top3_pct": 60, "reason": "本命"},
+                              {"mark": "○", "number": 4, "win_pct": 22, "top3_pct": 50, "reason": "対抗"},
+                              {"mark": "▲", "number": 1, "win_pct": 15, "top3_pct": 40, "reason": "単穴"},
+                              {"mark": "△", "number": 2, "win_pct": 10, "top3_pct": 30, "reason": "連下"}],
                     "bets": [{"type": "単勝", "combo": "10", "amount": 1000}],
                     "comment": ""}
         return {"marks": [{"mark": "◎", "number": 2, "reason": "討論で変更"},
@@ -333,6 +333,135 @@ with tempfile.TemporaryDirectory() as td:
         check("lock: re-acquirable after release", True)
     finally:
         _os.chdir(_cwd)
+
+# --- Probabilities + points (2026-11-05 feature) -------------------------
+import points as points_mod  # noqa: E402
+
+_marks_ok = o.parse_marks(text_ok)
+check("probs: parse from mark lines",
+      o.parse_probabilities(text_ok).get("◎") == (10, 30, 60))
+check("probs: valid set passes",
+      o.validate_probabilities(o.parse_probabilities(text_ok), _marks_ok) == [])
+_over = text_ok.replace("勝率30%", "勝率80%")
+check("probs: win sum over 100 rejected",
+      o.validate_probabilities(o.parse_probabilities(_over), o.parse_marks(_over)) != [])
+_missing = text_ok.replace(" 勝率10% 3着内30%", "")
+check("probs: missing estimate rejected",
+      o.validate_probabilities(o.parse_probabilities(_missing), o.parse_marks(_missing)) != [])
+_inverted = text_ok.replace("勝率30% 3着内60%", "勝率60% 3着内30%")
+check("probs: top3 below win rejected",
+      o.validate_probabilities(o.parse_probabilities(_inverted), o.parse_marks(_inverted)) != [])
+check("probs: prediction without probabilities rejected",
+      o.prediction_errors(text_ok.replace(" 勝率30% 3着内60%", ""), monbetsu) != [])
+check("fair odds: 25% -> 4.0", abs(o.fair_odds(25) - 4.0) < 1e-9)
+
+# bets under a points cap: any total up to the cap, no fixed 1,000
+check("bets: under-cap total passes",
+      o.validate_bets([{"type": "単勝", "numbers": [1], "amount": 700}],
+                      monbetsu, max_total=3000) == [])
+check("bets: over-cap total rejected",
+      o.validate_bets([{"type": "単勝", "numbers": [1], "amount": 3100}],
+                      monbetsu, max_total=3000) != [])
+check("bets: prediction with cap accepts non-1000 total",
+      o.prediction_errors(text_ok, monbetsu, max_total=3000) == [])
+
+fb600 = o.build_final_bet(ranking, monbetsu, total=600)
+check("final bet: total=600 splits evenly and validates",
+      fb600 is not None and sum(b["amount"] for b in fb600) == 600
+      and o.validate_bets(fb600, monbetsu, expected_total=600) == [])
+
+# --- settlement math (synthetic full payout table over the Monbetsu finish:
+# 1st=2, 2nd=4, 3rd=1) ---
+synth_results = json.loads(json.dumps(monbetsu_results))
+_brackets = {h["number"]: h["bracket"] for h in monbetsu["horses"]}
+_win_pair = sorted([_brackets[2], _brackets[4]])
+synth_results["payouts_jpy"] = {
+    "win": {"2": 290},
+    "place": {"2": 120, "4": 160, "1": 180},
+    "bracket": {"-".join(map(str, _win_pair)): 670},
+    "quinella": {"2-4": 690},
+    "wide": {"2-4": 280, "1-2": 290, "1-4": 470},
+    "exacta": {"2-4": 1250},
+    "trio": {"1-2-4": 1170},
+    "trifecta": {"2-4-1": 5020},
+}
+_b = lambda t, nums, amt: {"type": t, "numbers": nums, "amount": amt}  # noqa: E731
+check("settle: winning win-bet pays per 100",
+      o.bet_return(_b("単勝", [2], 200), monbetsu, synth_results) == 580)
+check("settle: losing win-bet pays 0",
+      o.bet_return(_b("単勝", [10], 200), monbetsu, synth_results) == 0)
+check("settle: exacta is order-sensitive",
+      o.bet_return(_b("馬単", [2, 4], 100), monbetsu, synth_results) == 1250
+      and o.bet_return(_b("馬単", [4, 2], 100), monbetsu, synth_results) == 0)
+check("settle: trifecta ordered / trio unordered",
+      o.bet_return(_b("3連単", [2, 4, 1], 100), monbetsu, synth_results) == 5020
+      and o.bet_return(_b("3連複", [4, 1, 2], 100), monbetsu, synth_results) == 1170)
+check("settle: wide pays when both are top-3",
+      o.bet_return(_b("ワイド", [1, 4], 100), monbetsu, synth_results) == 470)
+check("settle: place pays for 3rd, not for 4th",
+      o.bet_return(_b("複勝", [1], 100), monbetsu, synth_results) == 180
+      and o.bet_return(_b("複勝", [10], 100), monbetsu, synth_results) == 0)
+_no_exacta = json.loads(json.dumps(synth_results))
+del _no_exacta["payouts_jpy"]["exacta"]
+check("settle: winning bet with missing payout data returns None",
+      o.bet_return(_b("馬単", [2, 4], 100), monbetsu, _no_exacta) is None)
+
+# --- ledger: init, cap, idempotent settle, relief ---
+with tempfile.TemporaryDirectory() as td:
+    led = points_mod.PointsLedger(Path(td) / "points.json")
+    check("ledger: initial balance and 30% cap",
+          led.balance("chatgpt") == 10000 and led.cap("chatgpt") == 3000)
+    rec = led.settle("r1", "レース1", "chatgpt", 1000, 2500)
+    check("ledger: settle moves balance by returned - staked",
+          rec["balance"] == 11500 and led.balance("chatgpt") == 11500)
+    rec2 = led.settle("r1", "レース1", "chatgpt", 1000, 2500)
+    check("ledger: settle is idempotent per race+account",
+          rec2["balance"] == 11500 and led.balance("chatgpt") == 11500)
+    led.settle("r2", "レース2", "claude", 9950, 0)
+    check("ledger: balance can fall below the minimum bet",
+          led.balance("claude") == 50)
+    check("ledger: relief tops up once per race",
+          led.ensure_bettable("claude", "r3") is True
+          and led.balance("claude") == 1000
+          and led.ensure_bettable("claude", "r3") is False)
+
+# --- settle_race_points end to end ---
+with tempfile.TemporaryDirectory() as td:
+    led = points_mod.PointsLedger(Path(td) / "points.json")
+    state_syn = {
+        "race": "第1回 2歳 未勝利",
+        "race_id": monbetsu["race"]["race_id"],
+        "texts": {"predictions": {"chatgpt": text_ok}},
+        "final_bet": "単勝 2 500点\n3連複 1-2-4 500点",
+    }
+    recs = o.settle_race_points(monbetsu, synth_results, state_syn, led)
+    check("settle race: AI staked 1000 returned 0",
+          recs["chatgpt"]["staked"] == 1000 and recs["chatgpt"]["returned"] == 0
+          and led.balance("chatgpt") == 9000)
+    check("settle race: conclusion account settles the final bet",
+          recs["shikai"]["returned"] == 1450 + 5850
+          and led.balance("shikai") == 10000 - 1000 + 7300)
+
+# --- EV summary ---
+_ev_state = {"texts": {"predictions": {"chatgpt": text_ok}}}
+_ev = o.ev_summary(monbetsu, monbetsu_results, _ev_state)
+_odds2 = next(f["win_odds"] for f in monbetsu_results["finish"] if f["number"] == 2)
+_row = next(r for r in _ev["chatgpt"] if r["mark"] == "△")
+check("ev: win_pct x closing odds",
+      _row["ev"] is not None and abs(_row["ev"] - 0.10 * _odds2) < 1e-9)
+
+# --- generation with a points snapshot ---
+_snap = {
+    p["username"]: {"balance": 10000, "cap": 3000} for p in o.PERSONAS
+}
+_snap["shikai"] = {"balance": 10000, "cap": 3000}
+_gen_pts = o._generate_prediction_texts(
+    monbetsu, o.build_providers(mock=True), points=_snap
+)
+check("gen points: opening and conclusion carry balances and fair odds",
+      "持ち点" in _gen_pts["texts"]["opening"]
+      and "フェアオッズ" in _gen_pts["texts"]["conclusion"]
+      and "結論口座" in _gen_pts["texts"]["conclusion"])
 
 print()
 if fails:

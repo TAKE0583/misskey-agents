@@ -233,6 +233,55 @@ def nar_finish(race_id: str) -> list[dict]:
     return sorted(finish, key=lambda f: f["position"])
 
 
+PAYOUT_TYPES = {
+    # Japanese ticket type -> (payouts_jpy key, numbers per winning combo)
+    "単勝": ("win", 1),
+    "複勝": ("place", 1),
+    "枠連": ("bracket", 2),
+    "馬連": ("quinella", 2),
+    "ワイド": ("wide", 2),
+    "馬単": ("exacta", 2),
+    "3連複": ("trio", 3),
+    "3連単": ("trifecta", 3),
+}
+# Types whose combo key is order-insensitive (stored sorted); 馬単/3連単
+# keep the finishing order. 枠単 (NAR only) is not a bettable type in the
+# orchestrator and is skipped.
+PAYOUT_SORTED = {"win", "place", "bracket", "quinella", "wide", "trio"}
+
+
+def parse_payouts(soup: BeautifulSoup) -> dict:
+    """Parse the full Payout_Detail_Table(s) of a result page into
+    {type_key: {combo_key: yen_per_100_yen_ticket}}. Each table row packs
+    all winning combos of one type into space-separated cells (組番 /
+    払戻金 / 人気), so the numbers cell is chunked by the type's arity."""
+    payouts: dict[str, dict[str, int]] = {}
+    for table in soup.find_all("table", class_="Payout_Detail_Table"):
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if len(cells) < 3 or cells[0] not in PAYOUT_TYPES:
+                continue
+            key, arity = PAYOUT_TYPES[cells[0]]
+            try:
+                numbers = [int(x) for x in cells[1].split()]
+                amounts = [
+                    int(x.replace("円", "").replace(",", ""))
+                    for x in cells[2].split()
+                ]
+            except ValueError:
+                continue
+            if len(numbers) % arity or len(numbers) // arity != len(amounts):
+                continue  # unexpected shape; leave this type to the fallback
+            entry: dict[str, int] = {}
+            for i, amount in enumerate(amounts):
+                combo = numbers[i * arity:(i + 1) * arity]
+                if key in PAYOUT_SORTED:
+                    combo = sorted(combo)
+                entry["-".join(str(n) for n in combo)] = amount
+            payouts[key] = entry
+    return payouts
+
+
 def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
     if nar:
         cfg = ScrapingConfig(netkeiba_race_url=NAR_RACE_URL)
@@ -257,8 +306,23 @@ def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
                 "margin": "" if pd.isna(margin) else str(margin),
                 "win_odds": float(row["単勝オッズ"]),
             })
-    win = scraper.get_win_payoff().to_dict("records")[0]
-    trio = scraper.get_trio_payoff().to_dict("records")[0]
+    payouts = parse_payouts(scraper.soup)
+    if "win" not in payouts or "trio" not in payouts:
+        # Fallback: the vendor getters for the two types the review flow
+        # historically relied on.
+        win = scraper.get_win_payoff().to_dict("records")[0]
+        trio = scraper.get_trio_payoff().to_dict("records")[0]
+        payouts.setdefault(
+            "win", {str(int(win["単勝馬番_1"])): int(win["単勝払戻金_1"])}
+        )
+        payouts.setdefault(
+            "trio",
+            {
+                "-".join(
+                    str(int(trio[f"3連複組番_1_{i}"])) for i in (1, 2, 3)
+                ): int(trio["3連複払戻金_1"])
+            },
+        )
     r = fixture["race"]
     return {
         "race_id": race_id,
@@ -268,14 +332,7 @@ def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
         "winning_time": finish[0]["time"],
         "race_summary": "",
         "finish": finish,
-        "payouts_jpy": {
-            "win": {str(int(win["単勝馬番_1"])): int(win["単勝払戻金_1"])},
-            "trio": {
-                "-".join(str(int(trio[f"3連複組番_1_{i}"])) for i in (1, 2, 3)): int(
-                    trio["3連複払戻金_1"]
-                )
-            },
-        },
+        "payouts_jpy": payouts,
         "sources": [f"netkeiba race_id={race_id} (keiba-scraping)"],
     }
 

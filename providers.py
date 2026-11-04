@@ -351,12 +351,15 @@ class MockProvider(BaseProvider):
             "人気ほどの信頼はないが一発の魅力がある",
         ]
         lines = [f"【{self.persona}の予想（モック）】"]
-        for mark, (num, name), reason in zip(self._MARKS, picks, reasons):
-            lines.append(f"{mark} {num} {name} — {reason}。")
+        probs = [(30, 60), (22, 50), (15, 40), (10, 30)]
+        for mark, (num, name), reason, (win, top3) in zip(
+            self._MARKS, picks, reasons, probs
+        ):
+            lines.append(f"{mark} {num} {name} 勝率{win}% 3着内{top3}% — {reason}。")
         lines.append("総合判断として上位4頭に印を打ちました。（モック応答です）")
         lines.append("")
-        lines.append("【買い目（予算1,000円）】")
+        lines.append("【買い目】")
         combo = "-".join(str(x) for x in sorted(p[0] for p in picks[:3]))
-        lines.append(f"単勝 {picks[0][0]} 400円")
-        lines.append(f"3連複 {combo} 600円")
+        lines.append(f"単勝 {picks[0][0]} 400点")
+        lines.append(f"3連複 {combo} 600点")
         return "\n".join(lines)
