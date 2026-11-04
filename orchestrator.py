@@ -194,9 +194,14 @@ def validate_marks(
 def validate_bets(bets: list[dict], fixture: dict) -> list[str]:
     """bets: [{type, numbers: [int], amount: int}] — per-type shape, real
     runners, no duplicates inside a combo, positive 100-yen units, and a
-    total of exactly 1,000 yen."""
+    total of exactly 1,000 yen. 枠連 is the exception: its numbers are
+    BRACKET numbers, and a same-bracket pair (ゾロ目) is valid when that
+    bracket fields at least two horses (re-review 2026-11-04, finding 5)."""
     errors: list[str] = []
     valid = {h["number"] for h in fixture["horses"]}
+    brackets: dict[int, int] = {}
+    for h in fixture["horses"]:
+        brackets[h["bracket"]] = brackets.get(h["bracket"], 0) + 1
     if not bets:
         return ["買い目がありません"]
     total = 0
@@ -210,11 +215,21 @@ def validate_bets(bets: list[dict], fixture: dict) -> list[str]:
         want, _ordered = BET_TYPES[kind]
         if len(numbers) != want:
             errors.append(f"{kind} は {want} 頭の組み合わせが必要です（{len(numbers)} 頭でした）")
-        if len(set(numbers)) != len(numbers):
-            errors.append(f"{kind} {numbers} に同じ馬が重複しています")
-        for num in numbers:
-            if num not in valid:
-                errors.append(f"{kind} の馬番 {num} は出走馬に存在しません")
+        if kind == "枠連":
+            for num in numbers:
+                if num not in brackets:
+                    errors.append(f"枠連 の枠番 {num} は存在しません")
+            if len(numbers) == 2 and numbers[0] == numbers[1]:
+                if brackets.get(numbers[0], 0) < 2:
+                    errors.append(
+                        f"枠連 {numbers[0]}-{numbers[1]}（ゾロ目）は同枠に2頭以上必要です"
+                    )
+        else:
+            if len(set(numbers)) != len(numbers):
+                errors.append(f"{kind} {numbers} に同じ馬が重複しています")
+            for num in numbers:
+                if num not in valid:
+                    errors.append(f"{kind} の馬番 {num} は出走馬に存在しません")
         if not isinstance(amount, int) or amount <= 0 or amount % 100 != 0:
             errors.append(f"{kind} の金額 {amount} は正の100円単位にしてください")
         else:
@@ -373,6 +388,27 @@ def validate_ballot_obj(obj: object, fixture: dict) -> list[str]:
     return errors + validate_marks(marks, fixture)
 
 
+def render_ballot_block(marks: dict) -> str:
+    """The canonical 【最終票】 block for a validated ballot. The published
+    debate text, the saved state, and the aggregation must all carry the
+    SAME ballot (re-review 2026-11-04, finding 1: the local AI's prose
+    ballot and its structured ballot could diverge)."""
+    lines = ["【最終票】"]
+    for mk in MARKS:
+        if mk in marks:
+            num, name = marks[mk]
+            lines.append(f"{mk} {num} {name}")
+    return "\n".join(lines)
+
+
+def splice_ballot(text: str, marks: dict) -> str:
+    """Replace (or append) the ballot section of a debate text with the
+    canonical block rendered from the validated ballot."""
+    head = text.rfind("【最終票】")
+    base = text[:head].rstrip() if head >= 0 else text.rstrip()
+    return base + "\n\n" + render_ballot_block(marks)
+
+
 def generate_structured_ballot(prov, fixture: dict, context: str) -> dict[str, tuple[int, str]]:
     """The local LLM's final ballot after the debate, as {mark: (num, name)}
     with fixture-canonical names."""
@@ -424,10 +460,46 @@ def fixture_race_id(fixture: dict) -> str | None:
     return (fixture.get("race") or {}).get("race_id")
 
 
+def _legacy_results_mismatch(fixture: dict, results: dict) -> str | None:
+    """For files without a race_id: prove sameness, don't assume it.
+    Date + venue alone cannot distinguish two races on the same card
+    (re-review 2026-11-04, finding 3), so also require the race name and
+    a runner-by-runner match of the finish against the fixture. Returns
+    a mismatch reason, or None when the pair provably is the same race."""
+    fr = fixture["race"]
+    if fr.get("date") != results.get("date"):
+        return f"date: fixture {fr.get('date')} vs results {results.get('date')}"
+    if fr.get("venue") != results.get("venue"):
+        return f"venue: fixture {fr.get('venue')} vs results {results.get('venue')}"
+    if not fr.get("name") or fr["name"] not in (results.get("race") or ""):
+        return f"race name {fr.get('name')} not found in results {results.get('race')}"
+    names = {h["number"]: h["name"] for h in fixture["horses"]}
+    finish = results.get("finish") or []
+    if not finish:
+        return "results have no finish list to verify against"
+    for f in finish:
+        if names.get(f.get("number")) != f.get("name"):
+            return (
+                f"runner mismatch: number {f.get('number')} is "
+                f"{f.get('name')} in results but {names.get(f.get('number'))} in fixture"
+            )
+    return None
+
+
+def _legacy_state_mismatch(fixture: dict, state: dict) -> str | None:
+    """A state without a race_id must at least name the same race."""
+    expected = f"第{fixture['race'].get('edition')}回 {fixture['race'].get('name')}"
+    if state.get("race") != expected:
+        return f"state is for {state.get('race')}, fixture is {expected}"
+    return None
+
+
 def check_race_identity(fixture: dict, results: dict | None,
                         state: dict | None) -> None:
     """Refuse to combine data from different races (finding 8). Uses the
-    shared race_id when present; legacy files fall back to date + venue."""
+    shared race_id when present; legacy files must PROVE sameness via
+    name and field composition, and anything indeterminate stops the run
+    (re-review finding 3)."""
     fid = fixture_race_id(fixture)
     if results is not None:
         rid = results.get("race_id")
@@ -437,18 +509,45 @@ def check_race_identity(fixture: dict, results: dict | None,
                     f"race mismatch: fixture is {fid} but results are {rid}"
                 )
         else:
-            fr, rr = fixture["race"], results
-            if fr.get("date") != rr.get("date") or fr.get("venue") != rr.get("venue"):
+            reason = _legacy_results_mismatch(fixture, results)
+            if reason:
+                raise SystemExit(f"race mismatch (legacy check): {reason}")
+    if state is not None:
+        sid = state.get("race_id")
+        if fid and sid:
+            if fid != sid:
                 raise SystemExit(
-                    "race mismatch (legacy check): fixture "
-                    f"{fr.get('date')} {fr.get('venue')} vs results "
-                    f"{rr.get('date')} {rr.get('venue')}"
+                    f"race mismatch: fixture is {fid} but state is {sid}"
                 )
-    if state is not None and fid and state.get("race_id"):
-        if fid != state["race_id"]:
-            raise SystemExit(
-                f"race mismatch: fixture is {fid} but state is {state['race_id']}"
-            )
+        else:
+            reason = _legacy_state_mismatch(fixture, state)
+            if reason:
+                raise SystemExit(f"race mismatch (legacy state check): {reason}")
+
+
+def _migrate_legacy_state(data: dict) -> dict:
+    """Upgrade a v1 state in place (re-review 2026-11-04, finding 2).
+
+    A v1 state holds predictions/marks/conclusion but no stage, texts, or
+    note IDs. Anything that evidently ran is treated as COMPLETE: the new
+    code must never regenerate and repost it (regenerated text differs,
+    so exact-text reconciliation alone cannot prevent duplicates). A v1
+    review_posted_at becomes a legacy review record whose note ID is
+    unknown — run_review refuses to touch it without --force-review."""
+    data = dict(data)
+    data["version"] = 2
+    data["legacy"] = True
+    data.setdefault("note_ids", {})
+    if data.get("predictions") or data.get("marks") or data.get("conclusion_ranking"):
+        data["stage"] = "complete"
+    rp = data.get("review_posted_at")
+    if rp and "review" not in data:
+        data["review"] = {
+            "note_id": None,
+            "legacy_posted_at": rp,
+            "reflections": {},
+        }
+    return data
 
 
 class RunState:
@@ -460,7 +559,11 @@ class RunState:
     def open(cls, path: Path, fixture: dict, mode: str) -> "RunState":
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(path, data)
+            state = cls(path, data)
+            if data.get("version") != 2:
+                state.data = _migrate_legacy_state(data)
+                state.save()  # make the upgrade durable immediately
+            return state
         import uuid
 
         data = {
@@ -494,41 +597,54 @@ def state_path_for(fixture_path: str, live: bool, review_only: bool = False) -> 
 
 
 class RaceLock:
-    """Exclusive lock per fixture stem (live runs only). A stale lock whose
-    pid is gone is taken over."""
+    """Exclusive lock per fixture stem (live runs only), via flock(2):
+    the OS holds the lock on the open file description, so there is no
+    create-then-write window and no stale-file judgement call — a dead
+    holder's lock is released by the kernel (re-review 2026-11-04,
+    finding 6). The pid written into the file is informational only."""
 
     def __init__(self, fixture_path: str):
         stem = Path(fixture_path).stem
         self.path = Path("runs") / f"{stem}.lock"
-        self.acquired = False
+        self._fd: int | None = None
 
     def __enter__(self) -> "RaceLock":
+        import fcntl
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(2):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-                self.acquired = True
-                return self
-            except FileExistsError:
-                try:
-                    pid = int(self.path.read_text().strip())
-                    os.kill(pid, 0)
-                except (ValueError, ProcessLookupError):
-                    self.path.unlink(missing_ok=True)
-                    continue
-                except PermissionError:
-                    pass
-                raise SystemExit(
-                    f"another run holds the lock for this race (pid {pid}); "
-                    "refusing to run concurrently"
-                )
-        raise SystemExit("could not acquire race lock")
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = os.read(fd, 64).decode(errors="replace").strip()
+            os.close(fd)
+            raise SystemExit(
+                "another run holds the lock for this race "
+                f"({holder or 'pid unknown'}); refusing to run concurrently"
+            )
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid {os.getpid()}\n".encode())
+        self._fd = fd
+        return self
 
     def __exit__(self, *exc) -> None:
-        if self.acquired:
-            self.path.unlink(missing_ok=True)
+        if self._fd is not None:
+            import fcntl
+
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+
+
+def _backfill_race_id(store: "RunState", fixture: dict) -> None:
+    """Once identity is proven, stamp the fixture's race_id into a state
+    that lacks one, so later runs use the strong ID check (finding 3)."""
+    fid = fixture_race_id(fixture)
+    if fid and not store.data.get("race_id"):
+        store.data["race_id"] = fid
+        store.save()
 
 
 def build_final_bet(ranking: list, fixture: dict) -> list[dict] | None:
@@ -630,10 +746,29 @@ def _ballot_errors(text: str, fixture: dict) -> tuple[dict, list[str]]:
     return marks, validate_marks(marks, fixture)
 
 
-def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
+def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
+                               cache: dict | None = None, save=None) -> dict:
     """Generate every text (predictions, debate, final ballots, conclusion)
     before anything is posted. Any validation failure raises, so an invalid
-    run posts nothing at all."""
+    run posts nothing at all.
+
+    Generation is incremental (re-review 2026-11-04, finding 4): each AI's
+    prediction, debate+ballot, and the MC prose are stored into `cache`
+    (and persisted via `save()`) as soon as they are produced, so a
+    failure mid-generation never re-bills the steps that already
+    succeeded — a re-run reuses them and generates only what is missing.
+    """
+    if cache is None:
+        cache = {"predictions": {}, "debate": {}, "final_marks": {}}
+    else:
+        cache.setdefault("predictions", {})
+        cache.setdefault("debate", {})
+        cache.setdefault("final_marks", {})
+
+    def _save() -> None:
+        if save is not None:
+            save()
+
     body = race_text(fixture)
     r = fixture["race"]
     opening = (
@@ -649,10 +784,15 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
     predictions: dict[str, str] = {}
     for persona, prov in built:
         username = persona["username"]
+        if username in cache["predictions"]:
+            predictions[username] = cache["predictions"][username]
+            continue
         system = SYSTEM_TEMPLATE.format(display=persona["display"])
         user = f"次のレースの予想をしてください。\n\n{body}"
         if persona.get("structured") and hasattr(prov, "chat_json"):
             predictions[username] = generate_structured_prediction(prov, fixture)
+            cache["predictions"][username] = predictions[username]
+            _save()
             continue
         text = prov.chat(system, user)
         errors = prediction_errors(text, fixture) if text.strip() else ["出力が空でした"]
@@ -674,6 +814,8 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
                 )
             text = retry
         predictions[username] = text
+        cache["predictions"][username] = text
+        _save()
 
     initial_marks = {
         p["username"]: canonical_marks(predictions[p["username"]], fixture)
@@ -685,6 +827,12 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
     final_marks: dict[str, dict] = {}
     for persona, prov in built:
         username = persona["username"]
+        if username in cache["debate"] and username in cache["final_marks"]:
+            debate[username] = cache["debate"][username]
+            final_marks[username] = {
+                mk: tuple(v) for mk, v in cache["final_marks"][username].items()
+            }
+            continue
         others = "\n\n".join(
             f"--- {p['display']} の予想 ---\n{predictions[p['username']]}"
             for p, _ in built
@@ -712,7 +860,16 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
                 f"【自分の予想】\n{predictions[username]}\n\n"
                 f"【他のAIの予想】\n{others}\n\n【自分の議論】\n{text}"
             )
-            final_marks[username] = generate_structured_ballot(prov, fixture, context)
+            ballot = generate_structured_ballot(prov, fixture, context)
+            final_marks[username] = ballot
+            # Publish the validated structured ballot, not whatever the
+            # free-form debate prose happened to claim (finding 1).
+            debate[username] = splice_ballot(text, ballot)
+            cache["debate"][username] = debate[username]
+            cache["final_marks"][username] = {
+                mk: list(v) for mk, v in ballot.items()
+            }
+            _save()
             continue
         marks, errors = _ballot_errors(text, fixture)
         if errors:
@@ -737,6 +894,11 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
         final_marks[username] = {
             mk: (num, names.get(num, name)) for mk, (num, name) in marks.items()
         }
+        cache["debate"][username] = debate[username]
+        cache["final_marks"][username] = {
+            mk: list(v) for mk, v in final_marks[username].items()
+        }
+        _save()
 
     # --- aggregation over the FINAL ballots (initial scores break ties) ---
     def _scores(marks_by_user: dict) -> dict[int, dict]:
@@ -799,26 +961,35 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
         # The local LLM writes the moderator's summary prose; the ranking
         # above stays the deterministic ground truth. Any failure falls
         # back to the ranking-only conclusion. The prose no longer carries
-        # a bet: the final bet below is built deterministically.
-        try:
-            debate_digest = "\n\n".join(
-                f"--- {p['display']} の議論 ---\n{debate[p['username']][:400]}"
-                for p, _ in built
-            )
-            prose = mc_provider.chat(
-                "あなたは競馬予想の議論スレッドの司会AIです。各AIの議論を読み、"
-                "最終結論への総括を書きます。新しい印や順位は作らず、既に決まった"
-                "結論の根拠と、議論で浮かんだ注意点、討論で印が動いた点だけを"
-                "述べてください。買い目には触れないでください。",
-                f"レース: 第{r['edition']}回 {r['name']}\n"
-                f"最終結論の順位:\n" + "\n".join(lines[3:7]) + "\n\n"
-                f"各AIの議論（抜粋）:\n{debate_digest}\n\n"
-                "総括は500字以内で書いてください。",
-            )
-            if prose.strip():
-                conclusion += "\n\n【司会総括（ローカルLLM）】\n" + prose.strip()
-        except Exception as exc:  # noqa: BLE001 - prose is optional garnish
-            print(f"[mc prose skipped: {exc}]", file=sys.stderr)
+        # a bet: the final bet below is built deterministically. The
+        # outcome (including a fallback) is cached so a re-run does not
+        # re-bill it.
+        if "mc_prose" in cache:
+            prose = cache["mc_prose"]
+        else:
+            prose = ""
+            try:
+                debate_digest = "\n\n".join(
+                    f"--- {p['display']} の議論 ---\n{debate[p['username']][:400]}"
+                    for p, _ in built
+                )
+                prose = mc_provider.chat(
+                    "あなたは競馬予想の議論スレッドの司会AIです。各AIの議論を読み、"
+                    "最終結論への総括を書きます。新しい印や順位は作らず、既に決まった"
+                    "結論の根拠と、議論で浮かんだ注意点、討論で印が動いた点だけを"
+                    "述べてください。買い目には触れないでください。",
+                    f"レース: 第{r['edition']}回 {r['name']}\n"
+                    f"最終結論の順位:\n" + "\n".join(lines[3:7]) + "\n\n"
+                    f"各AIの議論（抜粋）:\n{debate_digest}\n\n"
+                    "総括は500字以内で書いてください。",
+                ).strip()
+            except Exception as exc:  # noqa: BLE001 - prose is optional garnish
+                print(f"[mc prose skipped: {exc}]", file=sys.stderr)
+                prose = ""
+            cache["mc_prose"] = prose
+            _save()
+        if prose:
+            conclusion += "\n\n【司会総括（ローカルLLM）】\n" + prose
     if bets_digest:
         conclusion += "\n\n【各AIの買い目（予算1,000円）】\n" + bets_digest
     if final_bet:
@@ -858,7 +1029,13 @@ def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
     run resumes instead of duplicating."""
     d = store.data
     if not d.get("texts"):
-        generated = _generate_prediction_texts(fixture, built, mc_provider=mc_provider)
+        cache = d.setdefault(
+            "gen", {"predictions": {}, "debate": {}, "final_marks": {}}
+        )
+        generated = _generate_prediction_texts(
+            fixture, built, mc_provider=mc_provider,
+            cache=cache, save=store.save,
+        )
         d.update(generated)
         d["stage"] = "generated"
         store.save()
@@ -987,6 +1164,13 @@ def run_review(
     if force:
         state.pop("review", None)
     review = state.setdefault("review", {})
+    if review.get("legacy_posted_at") and not review.get("note_id"):
+        raise SystemExit(
+            "legacy state: a review was already posted at "
+            f"{review['legacy_posted_at']} by the previous version, and its "
+            "note ID is unknown, so reflections cannot be threaded onto "
+            "it. Leaving it untouched (a full repost needs --force-review)."
+        )
     ledger: dict = review.setdefault("reflections", {})
 
     marks_map = state.get("final_marks") or state.get("marks") or {}
@@ -1085,7 +1269,9 @@ def main() -> int:
                     help="post a review again even if the ledger says it is complete")
     ap.add_argument("--force", action="store_true",
                     help="run even if the prediction state is marked complete "
-                         "(the resume logic still avoids duplicate posts)")
+                         "(the resume logic still avoids duplicate posts; "
+                         "for LEGACY states, whose note IDs were never "
+                         "recorded, a forced re-run can duplicate posts)")
     ap.add_argument("--local", action="store_true",
                     help="add the local LLM (Ollama on take-pc) as a fourth predictor "
                          "and let it write the moderator summary prose")
@@ -1112,6 +1298,7 @@ def main() -> int:
         try:
             store = RunState.open(path, fixture, "live" if live else "dryrun")
             check_race_identity(fixture, None, store.data)
+            _backfill_race_id(store, fixture)
             emitter = Emitter(live=live, usernames=[p["username"] for p in roster])
             run_review(fixture, results, store, emitter, built=built,
                        force=args.force_review)
@@ -1132,6 +1319,7 @@ def main() -> int:
             "live" if live else "dryrun",
         )
         check_race_identity(fixture, None, store.data)
+        _backfill_race_id(store, fixture)
         if store.data.get("stage") == "complete" and not args.force:
             raise SystemExit(
                 "prediction already completed for this race "

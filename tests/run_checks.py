@@ -182,6 +182,158 @@ try:
 except RuntimeError:
     check("structured: persistently invalid output raises", True)
 
+# --- Re-review (80aafaa) regression cases --------------------------------
+import os as _os
+import tempfile
+
+# #5: 枠連 is validated by bracket, not horse number
+bracket_counts = {}
+for h in monbetsu["horses"]:
+    bracket_counts[h["bracket"]] = bracket_counts.get(h["bracket"], 0) + 1
+multi = next(b for b, c in bracket_counts.items() if c >= 2)
+single = next(b for b, c in bracket_counts.items() if c == 1)
+check("wakuren: non-existent bracket rejected",
+      o.validate_bets([{"type": "枠連", "numbers": [1, 12], "amount": 1000}], monbetsu) != [])
+check("wakuren: same-bracket pair valid when bracket has 2+ horses",
+      o.validate_bets([{"type": "枠連", "numbers": [multi, multi], "amount": 1000}], monbetsu) == [])
+check("wakuren: same-bracket pair rejected when bracket has 1 horse",
+      o.validate_bets([{"type": "枠連", "numbers": [single, single], "amount": 1000}], monbetsu) != [])
+check("wakuren: two distinct brackets valid",
+      o.validate_bets([{"type": "枠連", "numbers": [multi, single], "amount": 1000}], monbetsu) == [])
+
+# #1: the local AI's published ballot must equal the aggregated ballot
+class _StructuredStub:
+    name = "stub"
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        return (
+            "議論します。他AIの見解は参考になりますが、私は押し切ります。\n\n"
+            "【最終票】\n◎ 10 タイムエッジ\n○ 4 ダムドローズ\n▲ 1 エリオラ\n△ 2 ラップドアップ"
+        )
+
+    def chat_json(self, system, user, schema, model=None, max_tokens=None):
+        if "bets" in (schema.get("required") or []):
+            return {"marks": [{"mark": "◎", "number": 10, "reason": "本命"},
+                              {"mark": "○", "number": 4, "reason": "対抗"},
+                              {"mark": "▲", "number": 1, "reason": "単穴"},
+                              {"mark": "△", "number": 2, "reason": "連下"}],
+                    "bets": [{"type": "単勝", "combo": "10", "amount": 1000}],
+                    "comment": ""}
+        return {"marks": [{"mark": "◎", "number": 2, "reason": "討論で変更"},
+                          {"mark": "○", "number": 10, "reason": "対抗"},
+                          {"mark": "▲", "number": 4, "reason": "単穴"},
+                          {"mark": "△", "number": 1, "reason": "連下"}],
+                "comment": ""}
+
+
+_local_persona = {"username": "local", "display": "ローカル", "structured": True}
+_gen = o._generate_prediction_texts(monbetsu, [(_local_persona, _StructuredStub())])
+_debate_text = _gen["texts"]["debate"]["local"]
+_ballot_idx = _debate_text.rfind("【最終票】")
+_published = o.parse_marks(_debate_text[_ballot_idx:])
+check("local ballot: published debate ballot equals aggregated ballot",
+      _published.get("◎", (None,))[0] == 2
+      and _gen["final_marks"]["local"]["◎"][0] == 2)
+
+# #2: legacy v1 state migration
+with tempfile.TemporaryDirectory() as td:
+    legacy_path = Path(td) / "legacy-state.json"
+    legacy_path.write_text(json.dumps({
+        "race": "第1回 2歳 未勝利",
+        "predictions": {"chatgpt": "…"},
+        "marks": {"chatgpt": {"◎": [10, "タイムエッジ"]}},
+        "conclusion_ranking": [{"number": 10, "name": "タイムエッジ", "score": 9}],
+        "review_posted_at": "2026-11-04T17:10:00+09:00",
+    }, ensure_ascii=False), encoding="utf-8")
+    store = o.RunState.open(legacy_path, monbetsu, "live")
+    check("legacy state: migrated to version 2 and marked complete",
+          store.data.get("version") == 2 and store.data.get("stage") == "complete")
+    check("legacy state: old review timestamp becomes a legacy review record",
+          (store.data.get("review") or {}).get("legacy_posted_at") is not None
+          and (store.data.get("review") or {}).get("note_id") is None)
+    try:
+        o.run_review(monbetsu, monbetsu_results, store, o.Emitter(live=False), built=[])
+        check("legacy state: review refuses to repost", False)
+    except SystemExit:
+        check("legacy state: review refuses to repost", True)
+
+# #3: legacy identity must distinguish same-day same-venue races
+other_results = json.loads(json.dumps(monbetsu_results))
+other_results.pop("race_id")
+other_results["race"] = "第3回 別のレース（条件）"
+for f in other_results["finish"]:
+    f["name"] = "ベツウマ"
+try:
+    o.check_race_identity(legacy_fixture, other_results, None)
+    check("identity: same-day same-venue different race rejected", False)
+except SystemExit:
+    check("identity: same-day same-venue different race rejected", True)
+try:
+    o.check_race_identity(monbetsu, None, {"race": "第99回 別レース"})
+    check("identity: legacy state for another race rejected", False)
+except SystemExit:
+    check("identity: legacy state for another race rejected", True)
+
+# #4: generation cache — a mid-generation failure must not re-bill successes
+class _CountingMock(providers.MockProvider):
+    def __init__(self, display):
+        super().__init__(display)
+        self.calls = 0
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        self.calls += 1
+        return super().chat(system, user, model=model, max_tokens=max_tokens)
+
+
+class _FlakyOnce:
+    name = "flaky"
+
+    def __init__(self, display):
+        self.inner = _CountingMock(display)
+        self.failed = False
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("simulated outage during prediction")
+        return self.inner.chat(system, user, model=model, max_tokens=max_tokens)
+
+
+prov_a = _CountingMock(o.PERSONAS[0]["display"])
+prov_b = _FlakyOnce(o.PERSONAS[1]["display"])
+built2 = [(o.PERSONAS[0], prov_a), (o.PERSONAS[1], prov_b)]
+cache = {"predictions": {}, "debate": {}, "final_marks": {}}
+try:
+    o._generate_prediction_texts(monbetsu, built2, cache=cache)
+    check("gen cache: first run fails on provider B", False)
+except RuntimeError:
+    check("gen cache: first run fails on provider B", True)
+a_calls_after_fail = prov_a.calls
+cache = json.loads(json.dumps(cache))  # simulate the state save/load cycle
+o._generate_prediction_texts(monbetsu, built2, cache=cache)
+check("gen cache: provider A not re-billed for its cached prediction",
+      prov_a.calls == a_calls_after_fail + 1)  # +1 is A's debate only
+
+# #6: flock-based race lock excludes a second holder, then frees
+_cwd = _os.getcwd()
+with tempfile.TemporaryDirectory() as td:
+    _os.chdir(td)
+    try:
+        lock1 = o.RaceLock("some-fixture.json")
+        lock1.__enter__()
+        try:
+            o.RaceLock("some-fixture.json").__enter__()
+            check("lock: second holder refused", False)
+        except SystemExit:
+            check("lock: second holder refused", True)
+        lock1.__exit__()
+        lock3 = o.RaceLock("some-fixture.json")
+        lock3.__enter__()
+        lock3.__exit__()
+        check("lock: re-acquirable after release", True)
+    finally:
+        _os.chdir(_cwd)
+
 print()
 if fails:
     print("FAILED:", ", ".join(fails))
