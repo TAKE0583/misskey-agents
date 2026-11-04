@@ -12,7 +12,8 @@
     "weather": "晴",
     "going": "良",
     "conditions": "オープン",
-    "field_size": 16
+    "field_size": 16,
+    "race_id": "200906050810"
   },
   "horses": [
     {

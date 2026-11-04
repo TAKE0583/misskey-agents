@@ -284,10 +284,24 @@ class MockProvider(BaseProvider):
         digest = hashlib.sha256(self.persona.encode()).hexdigest()
         return int(digest[:6], 16)
 
+    def _distinct_picks(self, horses, start):
+        """Pick 4 different horses, striding by 4 from `start` and skipping
+        any index already taken (the plain (start + i*4) % n formula repeats
+        the first horse when n == 12)."""
+        n = len(horses)
+        picks, seen = [], set()
+        for i in range(4):
+            idx = (start + i * 4) % n
+            while idx in seen and len(seen) < n:
+                idx = (idx + 1) % n
+            seen.add(idx)
+            picks.append(horses[idx])
+        return picks
+
     def chat(self, system, user, model=None, max_tokens=1200):
         self._calls += 1
         horses = self._horses(user)
-        if "回顧" in user:
+        if "回顧" in user or "反省" in user:
             return (
                 f"【{self.persona}・回顧（モック）】"
                 "結果と各AIの印を見比べると、本命の読みが当たった部分と、"
@@ -302,18 +316,34 @@ class MockProvider(BaseProvider):
                 target = f"{horses[0][0]}番{horses[0][1]}"
             else:
                 target = "自分の本命"
-            return (
+            text = (
                 f"【{self.persona}・議論（モック）】他AIの◎には一理ありますが、"
                 f"私はやはり{target}の近走内容とコース適性を"
                 "重視します。展開が速くなれば差し馬、落ち着けば好位組が残る"
                 "はずで、その分岐でも本命は揺るぎません。"
                 "対抗の評価だけ少し引き上げて応答します。（モック応答）"
             )
+            if len(horses) >= 4:
+                # Final ballot: keep the persona's own ◎ when it can be
+                # found, fill the other marks with distinct horses.
+                start = (self._seed() + (self._calls - 1) * 3) % len(horses)
+                ballot = self._distinct_picks(horses, start)
+                if own:
+                    own_pair = (int(own.group(1)), own.group(2))
+                    if own_pair in ballot:
+                        ballot.remove(own_pair)
+                    ballot.insert(0, own_pair)
+                    ballot = ballot[:4]
+                text += "\n\n【最終票】\n" + "\n".join(
+                    f"{mark} {num} {name}"
+                    for mark, (num, name) in zip(self._MARKS, ballot)
+                )
+            return text
         if not horses:
             return f"【{self.persona}（モック）】出走馬データを受け取りました。"
         n = len(horses)
         start = (self._seed() + (self._calls - 1) * 3) % n
-        picks = [horses[(start + i * 4) % n] for i in range(4)]
+        picks = self._distinct_picks(horses, start)
         reasons = [
             "近走の内容が安定し、距離・コース適性も高い",
             "騎手との相性と枠順の利がある",

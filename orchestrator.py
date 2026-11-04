@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -143,37 +144,149 @@ PREDICTION_SCHEMA = {
 }
 
 
-def validate_local_prediction(obj: object, fixture: dict) -> list[str]:
+# --- Shared prediction validation (all providers) --------------------------
+# Every prediction and final ballot, whatever the provider, must pass the
+# same validation before anything is posted: the four marks must name four
+# different real runners, and the bets must be well-formed per ticket type
+# and total exactly 1,000 yen. (External review 2026-11-04: previously only
+# the local LLM was validated, and only loosely — a non-existent #99 could
+# become the conclusion's honmei.)
+
+BET_TYPES: dict[str, tuple[int, bool]] = {
+    # ticket type -> (number of horses, ordered?)
+    "単勝": (1, False),
+    "複勝": (1, False),
+    "枠連": (2, False),
+    "馬連": (2, False),
+    "ワイド": (2, False),
+    "馬単": (2, True),
+    "3連複": (3, False),
+    "3連単": (3, True),
+}
+BET_LINE_RE = re.compile(
+    r"^(単勝|複勝|枠連|馬連|ワイド|馬単|3連複|3連単)\s+(\d+(?:-\d+)*)\s+(\d+)\s*円?$"
+)
+
+
+def validate_marks(
+    marks: dict[str, tuple[int, str]], fixture: dict
+) -> list[str]:
+    """marks: {mark: (number, name)} — must be exactly ◎○▲△ on four
+    different runners that exist in the fixture."""
     errors: list[str] = []
-    if not isinstance(obj, dict):
-        return ["出力がJSONオブジェクトではありません"]
-    valid_numbers = {h["number"] for h in fixture["horses"]}
-    marks = obj.get("marks") or []
-    seen_marks: set[str] = set()
-    seen_numbers: set[int] = set()
-    for m in marks:
-        if not isinstance(m, dict):
-            errors.append("marks の要素がオブジェクトではありません")
+    valid = {h["number"] for h in fixture["horses"]}
+    for mk in MARKS:
+        if mk not in marks:
+            errors.append(f"印 {mk} がありません")
+    seen: set[int] = set()
+    for mk, (num, _name) in marks.items():
+        if mk not in MARKS:
+            errors.append(f"未知の印 '{mk}' があります")
             continue
-        if m.get("mark") not in MARKS:
-            errors.append(f"印 '{m.get('mark')}' は ◎○▲△ のいずれかではありません")
-        elif m["mark"] in seen_marks:
-            errors.append(f"印 {m['mark']} が重複しています")
-        seen_marks.add(m.get("mark"))
-        num = m.get("number")
-        if num not in valid_numbers:
-            errors.append(f"馬番 {num} は出走馬に存在しません")
-        elif num in seen_numbers:
-            errors.append(f"馬番 {num} が重複して指名されています")
-        seen_numbers.add(num)
-    missing = [mk for mk in MARKS if mk not in seen_marks]
-    if missing:
-        errors.append(f"印が不足しています: {'・'.join(missing)}")
-    bets = obj.get("bets") or []
-    total = sum(b.get("amount", 0) for b in bets if isinstance(b, dict))
+        if num not in valid:
+            errors.append(f"{mk} の馬番 {num} は出走馬に存在しません")
+        elif num in seen:
+            errors.append(f"馬番 {num} が複数の印で重複しています")
+        seen.add(num)
+    return errors
+
+
+def validate_bets(bets: list[dict], fixture: dict) -> list[str]:
+    """bets: [{type, numbers: [int], amount: int}] — per-type shape, real
+    runners, no duplicates inside a combo, positive 100-yen units, and a
+    total of exactly 1,000 yen."""
+    errors: list[str] = []
+    valid = {h["number"] for h in fixture["horses"]}
+    if not bets:
+        return ["買い目がありません"]
+    total = 0
+    for b in bets:
+        kind = b.get("type")
+        numbers = b.get("numbers") or []
+        amount = b.get("amount")
+        if kind not in BET_TYPES:
+            errors.append(f"未知の券種 '{kind}' です")
+            continue
+        want, _ordered = BET_TYPES[kind]
+        if len(numbers) != want:
+            errors.append(f"{kind} は {want} 頭の組み合わせが必要です（{len(numbers)} 頭でした）")
+        if len(set(numbers)) != len(numbers):
+            errors.append(f"{kind} {numbers} に同じ馬が重複しています")
+        for num in numbers:
+            if num not in valid:
+                errors.append(f"{kind} の馬番 {num} は出走馬に存在しません")
+        if not isinstance(amount, int) or amount <= 0 or amount % 100 != 0:
+            errors.append(f"{kind} の金額 {amount} は正の100円単位にしてください")
+        else:
+            total += amount
     if total != 1000:
         errors.append(f"買い目の合計が {total} 円です。必ず合計1,000円にしてください")
     return errors
+
+
+def parse_bet_lines(section: str) -> tuple[list[dict], list[str]]:
+    """Parse a free-text 買い目 section into structured bets. Every
+    non-empty line must match the canonical '券種 組番 金額円' shape."""
+    bets: list[dict] = []
+    errors: list[str] = []
+    for raw in (section or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = BET_LINE_RE.match(line)
+        if not m:
+            errors.append(f"買い目の行を解釈できません: {line}")
+            continue
+        bets.append(
+            {
+                "type": m.group(1),
+                "numbers": [int(x) for x in m.group(2).split("-")],
+                "amount": int(m.group(3)),
+            }
+        )
+    return bets, errors
+
+
+def prediction_errors(text: str, fixture: dict) -> list[str]:
+    """Full validation of a free-text prediction (marks + bets)."""
+    errors = validate_marks(parse_marks(text), fixture)
+    section = extract_bets(text, limit=100000)
+    if not section:
+        errors.append("【買い目】のセクションがありません")
+        return errors
+    bets, perr = parse_bet_lines(section)
+    errors += perr
+    errors += validate_bets(bets, fixture)
+    return errors
+
+
+def validate_local_prediction(obj: object, fixture: dict) -> list[str]:
+    if not isinstance(obj, dict):
+        return ["出力がJSONオブジェクトではありません"]
+    marks: dict[str, tuple[int, str]] = {}
+    shape_errors: list[str] = []
+    for m in obj.get("marks") or []:
+        if not isinstance(m, dict) or m.get("mark") not in MARKS:
+            shape_errors.append(f"印の形式が不正です: {m}")
+            continue
+        if m["mark"] in marks:
+            shape_errors.append(f"印 {m['mark']} が重複しています")
+            continue
+        marks[m["mark"]] = (m.get("number"), "")
+    bets: list[dict] = []
+    for b in obj.get("bets") or []:
+        if not isinstance(b, dict):
+            shape_errors.append(f"買い目の形式が不正です: {b}")
+            continue
+        try:
+            numbers = [int(x) for x in str(b.get("combo", "")).split("-")]
+        except ValueError:
+            shape_errors.append(f"買い目の組番を解釈できません: {b.get('combo')}")
+            continue
+        bets.append(
+            {"type": b.get("type"), "numbers": numbers, "amount": b.get("amount")}
+        )
+    return shape_errors + validate_marks(marks, fixture) + validate_bets(bets, fixture)
 
 
 def render_local_prediction(obj: dict, fixture: dict) -> str:
@@ -191,40 +304,88 @@ def render_local_prediction(obj: dict, fixture: dict) -> str:
         lines.append(comment[:300])
     lines.append("")
     lines.append("【買い目（予算1,000円）】")
-    total = sum(b["amount"] for b in obj["bets"])
+    # Validation guarantees the total is exactly 1,000 yen at this point;
+    # there is deliberately no silent amount repair (external review
+    # 2026-11-04: the old fold-the-difference repair could itself fail and
+    # post a wrong total).
     for b in obj["bets"]:
         lines.append(f"{b['type']} {b['combo']} {b['amount']}円")
-    if total != 1000 and obj["bets"]:
-        # Deterministic repair (after a failed retry): fold the difference
-        # into the largest bet so the posted total is always exactly 1,000.
-        diff = 1000 - total
-        idx = max(range(len(obj["bets"])), key=lambda i: obj["bets"][i]["amount"])
-        if obj["bets"][idx]["amount"] + diff > 0:
-            obj["bets"][idx]["amount"] += diff
-            lines[-len(obj["bets"]) + idx] = (
-                f"{obj['bets'][idx]['type']} {obj['bets'][idx]['combo']} "
-                f"{obj['bets'][idx]['amount']}円"
-            )
     return "\n".join(lines)
+
+
+def _structured_with_retry(prov, system: str, user: str, schema: dict,
+                           validate, what: str):
+    """chat_json + one error-feedback retry. The result is adopted ONLY if
+    it validates with zero errors; otherwise RuntimeError — invalid data
+    must never reach rendering, aggregation, or posting."""
+    obj = prov.chat_json(system, user, schema)
+    errors = validate(obj)
+    if not errors:
+        return obj
+    print(f"[structured retry ({what}): {errors}]", file=sys.stderr)
+    retry_user = (
+        user
+        + "\n\n【重要】前回の出力に次の問題がありました: "
+        + " / ".join(errors)
+        + "\n問題をすべて直して、JSON形式で再度出力してください。"
+    )
+    obj = prov.chat_json(system, retry_user, schema)
+    errors = validate(obj)
+    if errors:
+        raise RuntimeError(f"{what}: validation failed after retry: {errors}")
+    return obj
 
 
 def generate_structured_prediction(prov, fixture: dict) -> str:
     body = race_text(fixture, form_limit=3)
     user = f"次のレースの予想をしてください。\n\n{body}"
-    obj = prov.chat_json(LOCAL_SYSTEM, user, PREDICTION_SCHEMA)
-    errors = validate_local_prediction(obj, fixture)
-    if errors:
-        print(f"[local structured retry: {errors}]", file=sys.stderr)
-        retry_user = (
-            user
-            + "\n\n【重要】前回の出力に次の問題がありました: "
-            + " / ".join(errors)
-            + "\n問題をすべて直して、JSON形式で再度出力してください。"
-        )
-        obj2 = prov.chat_json(LOCAL_SYSTEM, retry_user, PREDICTION_SCHEMA)
-        if len(validate_local_prediction(obj2, fixture)) <= len(errors):
-            obj = obj2
+    obj = _structured_with_retry(
+        prov, LOCAL_SYSTEM, user, PREDICTION_SCHEMA,
+        lambda o: validate_local_prediction(o, fixture),
+        "local prediction",
+    )
     return render_local_prediction(obj, fixture)
+
+
+BALLOT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "marks": PREDICTION_SCHEMA["properties"]["marks"],
+        "comment": {"type": "string"},
+    },
+    "required": ["marks"],
+}
+
+
+def validate_ballot_obj(obj: object, fixture: dict) -> list[str]:
+    if not isinstance(obj, dict):
+        return ["出力がJSONオブジェクトではありません"]
+    marks: dict[str, tuple[int, str]] = {}
+    errors: list[str] = []
+    for m in obj.get("marks") or []:
+        if not isinstance(m, dict) or m.get("mark") not in MARKS:
+            errors.append(f"印の形式が不正です: {m}")
+            continue
+        if m["mark"] in marks:
+            errors.append(f"印 {m['mark']} が重複しています")
+            continue
+        marks[m["mark"]] = (m.get("number"), "")
+    return errors + validate_marks(marks, fixture)
+
+
+def generate_structured_ballot(prov, fixture: dict, context: str) -> dict[str, tuple[int, str]]:
+    """The local LLM's final ballot after the debate, as {mark: (num, name)}
+    with fixture-canonical names."""
+    names = {h["number"]: h["name"] for h in fixture["horses"]}
+    obj = _structured_with_retry(
+        prov, LOCAL_SYSTEM, context, BALLOT_SCHEMA,
+        lambda o: validate_ballot_obj(o, fixture),
+        "local ballot",
+    )
+    return {
+        m["mark"]: (m["number"], names.get(m["number"], ""))
+        for m in obj["marks"]
+    }
 
 
 def canonical_marks(text: str, fixture: dict) -> dict[str, tuple[int, str]]:
@@ -250,6 +411,156 @@ def extract_bets(text: str, limit: int = 220) -> str:
     return section[:limit]
 
 
+# --- Run state, locking, identity ------------------------------------------
+# Live runs and dry runs keep separate state namespaces: a dry run must
+# never overwrite production state (external review 2026-11-04, finding 1).
+# Live posting is incremental and resumable: generated texts and every
+# posted note ID are saved as they happen, so a crash or provider failure
+# mid-run resumes where it stopped instead of re-posting (and re-billing)
+# everything (finding 2). A per-race lock keeps concurrent runs out.
+
+
+def fixture_race_id(fixture: dict) -> str | None:
+    return (fixture.get("race") or {}).get("race_id")
+
+
+def check_race_identity(fixture: dict, results: dict | None,
+                        state: dict | None) -> None:
+    """Refuse to combine data from different races (finding 8). Uses the
+    shared race_id when present; legacy files fall back to date + venue."""
+    fid = fixture_race_id(fixture)
+    if results is not None:
+        rid = results.get("race_id")
+        if fid and rid:
+            if fid != rid:
+                raise SystemExit(
+                    f"race mismatch: fixture is {fid} but results are {rid}"
+                )
+        else:
+            fr, rr = fixture["race"], results
+            if fr.get("date") != rr.get("date") or fr.get("venue") != rr.get("venue"):
+                raise SystemExit(
+                    "race mismatch (legacy check): fixture "
+                    f"{fr.get('date')} {fr.get('venue')} vs results "
+                    f"{rr.get('date')} {rr.get('venue')}"
+                )
+    if state is not None and fid and state.get("race_id"):
+        if fid != state["race_id"]:
+            raise SystemExit(
+                f"race mismatch: fixture is {fid} but state is {state['race_id']}"
+            )
+
+
+class RunState:
+    def __init__(self, path: Path, data: dict):
+        self.path = path
+        self.data = data
+
+    @classmethod
+    def open(cls, path: Path, fixture: dict, mode: str) -> "RunState":
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return cls(path, data)
+        import uuid
+
+        data = {
+            "version": 2,
+            "race_id": fixture_race_id(fixture),
+            "mode": mode,
+            "run_id": uuid.uuid4().hex[:12],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "stage": "new",
+            "note_ids": {},
+        }
+        state = cls(path, data)
+        state.save()
+        return state
+
+    def save(self) -> None:
+        self.data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.path)
+
+
+def state_path_for(fixture_path: str, live: bool, review_only: bool = False) -> Path:
+    stem = Path(fixture_path).stem
+    base = Path("runs") if live else Path("runs") / "dryrun"
+    suffix = "-review-state.json" if review_only else "-state.json"
+    return base / f"{stem}{suffix}"
+
+
+class RaceLock:
+    """Exclusive lock per fixture stem (live runs only). A stale lock whose
+    pid is gone is taken over."""
+
+    def __init__(self, fixture_path: str):
+        stem = Path(fixture_path).stem
+        self.path = Path("runs") / f"{stem}.lock"
+        self.acquired = False
+
+    def __enter__(self) -> "RaceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self.acquired = True
+                return self
+            except FileExistsError:
+                try:
+                    pid = int(self.path.read_text().strip())
+                    os.kill(pid, 0)
+                except (ValueError, ProcessLookupError):
+                    self.path.unlink(missing_ok=True)
+                    continue
+                except PermissionError:
+                    pass
+                raise SystemExit(
+                    f"another run holds the lock for this race (pid {pid}); "
+                    "refusing to run concurrently"
+                )
+        raise SystemExit("could not acquire race lock")
+
+    def __exit__(self, *exc) -> None:
+        if self.acquired:
+            self.path.unlink(missing_ok=True)
+
+
+def build_final_bet(ranking: list, fixture: dict) -> list[dict] | None:
+    """The moderator's consolidated bet, built deterministically from the
+    final ranking so it is valid by construction (finding 6)."""
+    nums = [num for num, _info in ranking]
+    bets: list[dict] | None = None
+    if len(nums) >= 3:
+        bets = [
+            {"type": "単勝", "numbers": [nums[0]], "amount": 500},
+            {"type": "3連複", "numbers": sorted(nums[:3]), "amount": 500},
+        ]
+    elif len(nums) == 2:
+        bets = [
+            {"type": "単勝", "numbers": [nums[0]], "amount": 500},
+            {"type": "馬連", "numbers": sorted(nums[:2]), "amount": 500},
+        ]
+    elif len(nums) == 1:
+        bets = [{"type": "単勝", "numbers": [nums[0]], "amount": 1000}]
+    if bets is not None:
+        errors = validate_bets(bets, fixture)
+        assert not errors, f"final bet must validate: {errors}"
+    return bets
+
+
+def format_bets(bets: list[dict]) -> str:
+    return "\n".join(
+        f"{b['type']} {'-'.join(str(n) for n in b['numbers'])} {b['amount']}円"
+        for b in bets
+    )
+
+
 class Emitter:
     """Prints in dry-run mode; posts to Misskey in live mode."""
 
@@ -269,6 +580,18 @@ class Emitter:
             print(f"\n===== @{username}{target} =====")
             print(text)
             return f"dryrun-{username}-{abs(hash(text)) % 10**8}"
+        # Reconcile before posting: if an identical note by this author
+        # already exists (e.g. a previous run posted it but the response
+        # was lost), adopt it instead of posting a duplicate.
+        existing = self.client.find_note_by_text(
+            self.tokens[username], text, reply_to
+        )
+        if existing:
+            print(
+                f"[adopted existing note {existing} for @{username}]",
+                file=sys.stderr,
+            )
+            return existing
         note = self.client.post_note(self.tokens[username], text, reply_id=reply_to)
         time.sleep(1)
         return note.get("id")
@@ -299,7 +622,18 @@ def preflight(built, live: bool) -> None:
         )
 
 
-def run_prediction(fixture: dict, emitter: Emitter, built, mc_provider=None) -> dict:
+def _ballot_errors(text: str, fixture: dict) -> tuple[dict, list[str]]:
+    idx = text.rfind("【最終票】")
+    if idx < 0:
+        return {}, ["【最終票】のセクションがありません"]
+    marks = parse_marks(text[idx:])
+    return marks, validate_marks(marks, fixture)
+
+
+def _generate_prediction_texts(fixture: dict, built, mc_provider=None) -> dict:
+    """Generate every text (predictions, debate, final ballots, conclusion)
+    before anything is posted. Any validation failure raises, so an invalid
+    run posts nothing at all."""
     body = race_text(fixture)
     r = fixture["race"]
     opening = (
@@ -310,106 +644,162 @@ def run_prediction(fixture: dict, emitter: Emitter, built, mc_provider=None) -> 
         )
         + "\n\n各AIの皆さん、総合判断での予想をお願いします。議論ののち、最終結論を一つにまとめます。"
     )
-    root_id = emitter.emit(MC_USERNAME, opening, None)
 
+    # --- initial predictions (validated for every provider) ---
     predictions: dict[str, str] = {}
     for persona, prov in built:
+        username = persona["username"]
         system = SYSTEM_TEMPLATE.format(display=persona["display"])
         user = f"次のレースの予想をしてください。\n\n{body}"
         if persona.get("structured") and hasattr(prov, "chat_json"):
-            # Local LLM: schema-constrained JSON, validated and rendered
-            # by the orchestrator (see generate_structured_prediction).
-            text = generate_structured_prediction(prov, fixture)
-            predictions[persona["username"]] = text
+            predictions[username] = generate_structured_prediction(prov, fixture)
             continue
         text = prov.chat(system, user)
-        quality = lambda t: (len(parse_marks(t)), 1 if extract_bets(t) else 0)  # noqa: E731
-        if quality(text) < (len(MARKS), 1):
-            # Format insurance: some models (notably the local 14B) drop the
-            # required mark lines or the bets section. Re-ask once with an
-            # explicit correction, keeping whichever output is more complete.
+        errors = prediction_errors(text, fixture) if text.strip() else ["出力が空でした"]
+        if errors:
+            print(f"[prediction retry for {username}: {errors}]", file=sys.stderr)
             retry = prov.chat(
                 system,
                 user
-                + "\n\n【重要】前回の出力は形式が崩れていました。必ず次の4行を"
-                "そのままの形式で含めてください（番号付きリストや見出しは禁止）:\n"
-                "◎ 馬番 馬名 — 理由\n○ 馬番 馬名 — 理由\n"
-                "▲ 馬番 馬名 — 理由\n△ 馬番 馬名 — 理由\n"
-                "さらに【買い目（予算1,000円）】のセクションも必ず含めてください。",
+                + "\n\n【重要】前回の出力に次の問題がありました: "
+                + " / ".join(errors)
+                + "\nすべて直して、印4つ（◎○▲△、すべて異なる実在の馬）と"
+                "【買い目（予算1,000円）】（券種ごとの頭数・金額を守り、合計1,000円）"
+                "を含む完全な予想を出し直してください。",
             )
-            if quality(retry) > quality(text):
-                text = retry
-            print(
-                f"[format retry for {persona['username']}: "
-                f"marks={len(parse_marks(text))}, bets={'y' if extract_bets(text) else 'n'}]",
-                file=sys.stderr,
-            )
-        if not text.strip():
-            raise RuntimeError(f"empty prediction from {persona['username']}")
-        predictions[persona["username"]] = text
-    for persona, _ in built:
-        emitter.emit(
-            persona["username"], predictions[persona["username"]], root_id
-        )
+            errors = prediction_errors(retry, fixture) if retry.strip() else ["再生成の出力が空でした"]
+            if errors:
+                raise RuntimeError(
+                    f"prediction from {username} failed validation after retry: {errors}"
+                )
+            text = retry
+        predictions[username] = text
 
-    # --- debate round ---
+    initial_marks = {
+        p["username"]: canonical_marks(predictions[p["username"]], fixture)
+        for p, _ in built
+    }
+
+    # --- debate + final ballots ---
     debate: dict[str, str] = {}
+    final_marks: dict[str, dict] = {}
     for persona, prov in built:
+        username = persona["username"]
         others = "\n\n".join(
             f"--- {p['display']} の予想 ---\n{predictions[p['username']]}"
             for p, _ in built
-            if p["username"] != persona["username"]
+            if p["username"] != username
         )
         system = SYSTEM_TEMPLATE.format(display=persona["display"])
         user = (
-            "他のAIの予想が出そろいました。議論として応答してください。"
-            "最も同意できる点と最も異論のある点を具体的に挙げ、必要なら自分の印の修正案も示してください。\n\n"
-            f"【自分の予想】\n{predictions[persona['username']]}\n\n【他のAIの予想】\n{others}"
+            "他のAIの予想が出そろいました。元の出走データと各AIの予想を踏まえて、"
+            "議論として応答してください。最も同意できる点と最も異論のある点を"
+            "具体的に挙げてください。\n"
+            "最後に、議論を踏まえたあなたの最終票を必ず次の形式で書いてください"
+            "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にしてください）:\n"
+            "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
+            f"【元の出走データ】\n{body}\n\n"
+            f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{others}"
         )
         text = prov.chat(system, user)
         if not text.strip():
-            raise RuntimeError(f"empty debate reply from {persona['username']}")
-        debate[persona["username"]] = text
-    for persona, _ in built:
-        emitter.emit(persona["username"], debate[persona["username"]], root_id)
+            raise RuntimeError(f"empty debate reply from {username}")
+        debate[username] = text
+        if persona.get("structured") and hasattr(prov, "chat_json"):
+            context = (
+                "次のレースについて、他のAIとの議論を踏まえた最終票をJSONで出してください。\n\n"
+                f"【元の出走データ】\n{race_text(fixture, form_limit=3)}\n\n"
+                f"【自分の予想】\n{predictions[username]}\n\n"
+                f"【他のAIの予想】\n{others}\n\n【自分の議論】\n{text}"
+            )
+            final_marks[username] = generate_structured_ballot(prov, fixture, context)
+            continue
+        marks, errors = _ballot_errors(text, fixture)
+        if errors:
+            print(f"[ballot retry for {username}: {errors}]", file=sys.stderr)
+            retry = prov.chat(
+                system,
+                "最終票だけを出し直してください。前回の問題: "
+                + " / ".join(errors)
+                + "\n次の形式のみで出力してください:\n"
+                "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
+                f"【元の出走データ】\n{body}",
+            )
+            marks, errors = _ballot_errors(retry, fixture)
+            if errors:
+                raise RuntimeError(
+                    f"final ballot from {username} failed validation after retry: {errors}"
+                )
+            head = text.rfind("【最終票】")
+            base = text[:head].rstrip() if head >= 0 else text.rstrip()
+            debate[username] = base + "\n\n" + retry.strip()
+        names = {h["number"]: h["name"] for h in fixture["horses"]}
+        final_marks[username] = {
+            mk: (num, names.get(num, name)) for mk, (num, name) in marks.items()
+        }
 
-    # --- MC conclusion ---
-    scores: dict[int, dict] = {}
-    for persona, _ in built:
-        for mark, (num, name) in canonical_marks(
-            predictions[persona["username"]], fixture
-        ).items():
-            entry = scores.setdefault(num, {"name": name, "score": 0, "marks": {}})
-            entry["score"] += MARK_SCORE[mark]
-            entry["marks"][persona["display"]] = mark
-    ranking = sorted(scores.items(), key=lambda kv: -kv[1]["score"])
-    lines = [f"【最終結論】第{r['edition']}回 {r['name']}", ""]
-    if ranking:
-        top_num, top = ranking[0]
-        lines.append(f"◎ {top_num} {top['name']}（総意の本命）")
-        for num, info in ranking[1:4]:
-            lines.append(f"・ {num} {info['name']}（スコア {info['score']}）")
-        lines.append("")
-        lines.append("各AIの本命：")
-        for persona, _ in built:
-            m = canonical_marks(predictions[persona["username"]], fixture).get("◎")
-            if m:
-                lines.append(f"  {persona['display']}: ◎ {m[0]} {m[1]}")
-    lines.append("")
-    lines.append("議論を踏まえた集約です。結果が出たら回顧します。")
-    conclusion = "\n".join(lines)
-    bets = {
-        p["username"]: extract_bets(predictions[p["username"]]) for p, _ in built
-    }
+    # --- aggregation over the FINAL ballots (initial scores break ties) ---
+    def _scores(marks_by_user: dict) -> dict[int, dict]:
+        out: dict[int, dict] = {}
+        for p, _ in built:
+            for mark, (num, name) in marks_by_user[p["username"]].items():
+                entry = out.setdefault(num, {"name": name, "score": 0, "marks": {}})
+                entry["score"] += MARK_SCORE[mark]
+                entry["marks"][p["display"]] = mark
+        return out
+
+    initial_scores = _scores(initial_marks)
+    final_scores = _scores(final_marks)
+    ranking = sorted(
+        final_scores.items(),
+        key=lambda kv: (
+            -kv[1]["score"],
+            -initial_scores.get(kv[0], {"score": 0})["score"],
+            kv[0],
+        ),
+    )
+
+    bets = {p["username"]: extract_bets(predictions[p["username"]]) for p, _ in built}
     bets_digest = "\n".join(
         f"{p['display']}: {bets[p['username']].replace(chr(10), ' / ')}"
         for p, _ in built
         if bets[p["username"]]
     )
+    final_bet = build_final_bet(ranking, fixture)
+
+    lines = [f"【最終結論】第{r['edition']}回 {r['name']}", "（討論後の最終票を集計）", ""]
+    if ranking:
+        top_num, top = ranking[0]
+        lines.append(f"◎ {top_num} {top['name']}（総意の本命）")
+        for num, info in ranking[1:4]:
+            init = initial_scores.get(num, {"score": 0})["score"]
+            lines.append(f"・ {num} {info['name']}（最終スコア {info['score']} / 初期 {init}）")
+        lines.append("")
+        lines.append("各AIの最終本命：")
+        for persona, _ in built:
+            m = final_marks[persona["username"]].get("◎")
+            if m:
+                lines.append(f"  {persona['display']}: ◎ {m[0]} {m[1]}")
+        changed = []
+        for persona, _ in built:
+            before = initial_marks[persona["username"]].get("◎")
+            after = final_marks[persona["username"]].get("◎")
+            if before and after and before[0] != after[0]:
+                changed.append(
+                    f"  {persona['display']}: ◎ {before[0]} {before[1]} → {after[0]} {after[1]}"
+                )
+        lines.append("")
+        if changed:
+            lines.append("討論での本命の変動：")
+            lines.extend(changed)
+        else:
+            lines.append("討論でも各AIの本命は変わりませんでした。")
+    conclusion = "\n".join(lines)
     if mc_provider is not None and ranking:
         # The local LLM writes the moderator's summary prose; the ranking
         # above stays the deterministic ground truth. Any failure falls
-        # back to the ranking-only conclusion.
+        # back to the ranking-only conclusion. The prose no longer carries
+        # a bet: the final bet below is built deterministically.
         try:
             debate_digest = "\n\n".join(
                 f"--- {p['display']} の議論 ---\n{debate[p['username']][:400]}"
@@ -418,12 +808,10 @@ def run_prediction(fixture: dict, emitter: Emitter, built, mc_provider=None) -> 
             prose = mc_provider.chat(
                 "あなたは競馬予想の議論スレッドの司会AIです。各AIの議論を読み、"
                 "最終結論への総括を書きます。新しい印や順位は作らず、既に決まった"
-                "結論の根拠と、議論で浮かんだ注意点だけを述べてください。"
-                "最後に、集約としての最終買い目を予算1,000円で1〜3点"
-                "（券種・組み合わせ・金額、合計1,000円ちょうど）提案してください。",
+                "結論の根拠と、議論で浮かんだ注意点、討論で印が動いた点だけを"
+                "述べてください。買い目には触れないでください。",
                 f"レース: 第{r['edition']}回 {r['name']}\n"
-                f"最終結論の順位:\n" + "\n".join(lines[2:6]) + "\n\n"
-                f"各AIの買い目:\n{bets_digest}\n\n"
+                f"最終結論の順位:\n" + "\n".join(lines[3:7]) + "\n\n"
                 f"各AIの議論（抜粋）:\n{debate_digest}\n\n"
                 "総括は500字以内で書いてください。",
             )
@@ -433,27 +821,76 @@ def run_prediction(fixture: dict, emitter: Emitter, built, mc_provider=None) -> 
             print(f"[mc prose skipped: {exc}]", file=sys.stderr)
     if bets_digest:
         conclusion += "\n\n【各AIの買い目（予算1,000円）】\n" + bets_digest
-    emitter.emit(MC_USERNAME, conclusion, root_id)
+    if final_bet:
+        conclusion += "\n\n【最終買い目（予算1,000円）】\n" + format_bets(final_bet)
+    conclusion += "\n\n結果が出たら回顧します。"
 
+    serialize = lambda marks_by_user: {  # noqa: E731
+        u: {k: list(v) for k, v in marks.items()}
+        for u, marks in marks_by_user.items()
+    }
     return {
         "race": f"第{r['edition']}回 {r['name']}",
-        "predictions": predictions,
-        "debate": debate,
-        "marks": {
-            p["username"]: {
-                k: list(v)
-                for k, v in canonical_marks(
-                    predictions[p["username"]], fixture
-                ).items()
-            }
-            for p, _ in built
+        "texts": {
+            "opening": opening,
+            "predictions": predictions,
+            "debate": debate,
+            "conclusion": conclusion,
         },
+        "initial_marks": serialize(initial_marks),
+        "final_marks": serialize(final_marks),
+        # Back-compat: "marks" is what reviews historically read; it now
+        # holds the FINAL marks, which are what the conclusion used.
+        "marks": serialize(final_marks),
         "conclusion_ranking": [
             {"number": num, "name": info["name"], "score": info["score"]}
             for num, info in ranking
         ],
         "bets": bets,
+        "final_bet": format_bets(final_bet) if final_bet else None,
     }
+
+
+def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
+                   mc_provider=None) -> dict:
+    """Two-phase run: generate everything (validating as we go), persist,
+    then post note by note, recording each note ID so an interrupted live
+    run resumes instead of duplicating."""
+    d = store.data
+    if not d.get("texts"):
+        generated = _generate_prediction_texts(fixture, built, mc_provider=mc_provider)
+        d.update(generated)
+        d["stage"] = "generated"
+        store.save()
+    texts = d["texts"]
+    ids = d.setdefault("note_ids", {})
+
+    def post_once(key: str, username: str, text: str, reply_to) -> str:
+        if key in ids:
+            return ids[key]
+        note_id = emitter.emit(username, text, reply_to)
+        ids[key] = note_id
+        store.save()
+        return note_id
+
+    root_id = post_once("root", MC_USERNAME, texts["opening"], None)
+    ids.setdefault("predictions", {})
+    ids.setdefault("debate", {})
+    for persona, _ in built:
+        u = persona["username"]
+        if u not in ids["predictions"]:
+            ids["predictions"][u] = emitter.emit(u, texts["predictions"][u], root_id)
+            store.save()
+    for persona, _ in built:
+        u = persona["username"]
+        if u not in ids["debate"]:
+            ids["debate"][u] = emitter.emit(u, texts["debate"][u], root_id)
+            store.save()
+    post_once("conclusion", MC_USERNAME, texts["conclusion"], root_id)
+    d["stage"] = "complete"
+    store.save()
+    return d
+
 
 
 REFLECTION_SYSTEM = """あなたは {display} です。競馬予想AIとして予想スレッドに参加し、レースが終わりました。
@@ -480,7 +917,8 @@ def reflection_user_prompt(
         )
     lines.append("")
     lines.append("【あなたの印と実際の着順】")
-    for mark, (num, name) in (state.get("marks", {}).get(username) or {}).items():
+    marks_map = state.get("final_marks") or state.get("marks") or {}
+    for mark, (num, name) in (marks_map.get(username) or {}).items():
         fin = actual.get(num)
         lines.append(
             f"  {mark} {num} {name} → {fin['position']}着" if fin else f"  {mark} {num} {name} → 着順不明"
@@ -494,13 +932,7 @@ def reflection_user_prompt(
     return "\n".join(lines)
 
 
-def run_review(
-    fixture: dict,
-    results: dict,
-    state: dict | None,
-    emitter: Emitter,
-    built: list | None = None,
-) -> None:
+def build_review_text(fixture: dict, results: dict, state: dict | None) -> str:
     top = results["finish"][:5]
     lines = [
         f"【回顧】{results['race']}",
@@ -525,7 +957,8 @@ def run_review(
             "本命が優勝！" if pos == 1 else f"最終結論の本命 {best['name']} は {pos}着でした。"
         )
         lines.append(f"最終結論の検証：{verdict}")
-        for username, marks in (state.get("marks") or {}).items():
+        marks_map = state.get("final_marks") or state.get("marks") or {}
+        for username, marks in marks_map.items():
             honmei = marks.get("◎")
             if honmei:
                 lines.append(
@@ -534,30 +967,110 @@ def run_review(
     else:
         lines.append("（予想スレッドの記録がないため、結果のみの回顧です）")
     lines.append("次回の予想に活かします。")
-    review_text = "\n".join(lines)
+    return "\n".join(lines)
 
-    # Per-AI reflections: generate every text BEFORE posting anything, so a
-    # provider failure cannot leave a half-finished review thread.
-    reflections: list[tuple[str, str]] = []
-    if built and state and state.get("marks"):
+
+def run_review(
+    fixture: dict,
+    results: dict,
+    store: RunState,
+    emitter: Emitter,
+    built: list | None = None,
+    force: bool = False,
+) -> None:
+    """Post the review note and each AI's reflection, with a per-item
+    ledger in the state file. Completion is tracked per reflection, so a
+    partially failed review resumes by posting only what is missing
+    (findings 7 and 9); generation results are cached in the ledger so a
+    resume never re-bills a provider for a text it already produced."""
+    state = store.data
+    if force:
+        state.pop("review", None)
+    review = state.setdefault("review", {})
+    ledger: dict = review.setdefault("reflections", {})
+
+    marks_map = state.get("final_marks") or state.get("marks") or {}
+    participants = []
+    if built:
         for persona, prov in built:
             username = persona["username"]
-            if username not in (state.get("marks") or {}):
-                continue  # this AI did not predict this race
-            try:
-                text = prov.chat(
-                    REFLECTION_SYSTEM.format(display=persona["display"]),
-                    reflection_user_prompt(fixture, results, state, username),
-                )
-            except Exception as e:  # noqa: BLE001 - skip this AI, keep others
-                print(f"[reflection failed for {username}: {e}]", file=sys.stderr)
-                continue
-            if text and text.strip():
-                reflections.append((username, f"【反省】{results['race']}\n\n{text.strip()}"))
+            if username in marks_map:
+                participants.append((persona, prov))
 
-    review_id = emitter.emit(MC_USERNAME, review_text, None)
-    for username, text in reflections:
-        emitter.emit(username, text, review_id)
+    def _all_posted() -> bool:
+        return bool(review.get("note_id")) and all(
+            ledger.get(p["username"], {}).get("status") == "posted"
+            for p, _ in participants
+        )
+
+    if review.get("note_id") and _all_posted():
+        raise SystemExit(
+            "review already fully posted (note "
+            f"{review['note_id']}); use --force-review to post it all again"
+        )
+
+    failures: list[str] = []
+
+    # Generate any missing reflection texts first (cached in the ledger).
+    for persona, prov in participants:
+        username = persona["username"]
+        entry = ledger.setdefault(username, {})
+        if entry.get("status") == "posted" or entry.get("text"):
+            continue
+        try:
+            text = prov.chat(
+                REFLECTION_SYSTEM.format(display=persona["display"]),
+                reflection_user_prompt(fixture, results, state, username),
+            )
+        except Exception as e:  # noqa: BLE001 - record and continue with others
+            entry["status"] = "failed"
+            entry["error"] = f"generation: {e}"
+            failures.append(username)
+            store.save()
+            continue
+        if text and text.strip():
+            entry["text"] = f"【反省】{results['race']}\n\n{text.strip()}"
+            entry["status"] = "generated"
+        else:
+            entry["status"] = "failed"
+            entry["error"] = "generation: empty response"
+            failures.append(username)
+        store.save()
+
+    # Post the review note itself.
+    if not review.get("note_id"):
+        review_id = emitter.emit(
+            MC_USERNAME, build_review_text(fixture, results, state), None
+        )
+        review["note_id"] = review_id
+        review["posted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        state["review_posted_at"] = review["posted_at"]  # legacy field
+        store.save()
+    review_id = review["note_id"]
+
+    # Post the reflections that are ready.
+    for persona, _prov in participants:
+        username = persona["username"]
+        entry = ledger.get(username, {})
+        if entry.get("status") == "posted" or not entry.get("text"):
+            continue
+        try:
+            entry["note_id"] = emitter.emit(username, entry["text"], review_id)
+            entry["status"] = "posted"
+            entry.pop("error", None)
+        except Exception as e:  # noqa: BLE001
+            entry["status"] = "failed"
+            entry["error"] = f"posting: {e}"
+            if username not in failures:
+                failures.append(username)
+        store.save()
+
+    if failures:
+        raise SystemExit(
+            "review posted, but reflections are incomplete for: "
+            + ", ".join(failures)
+            + ". Re-run the same command to post only the missing ones."
+        )
 
 
 def main() -> int:
@@ -569,7 +1082,10 @@ def main() -> int:
     ap.add_argument("--review", action="store_true", help="post a review using --results")
     ap.add_argument("--results", default=None, help="results JSON (review mode only)")
     ap.add_argument("--force-review", action="store_true",
-                    help="post a review even if the state file says one was posted")
+                    help="post a review again even if the ledger says it is complete")
+    ap.add_argument("--force", action="store_true",
+                    help="run even if the prediction state is marked complete "
+                         "(the resume logic still avoids duplicate posts)")
     ap.add_argument("--local", action="store_true",
                     help="add the local LLM (Ollama on take-pc) as a fourth predictor "
                          "and let it write the moderator summary prose")
@@ -578,51 +1094,59 @@ def main() -> int:
     live = bool(args.live) and not args.dry_run
     fixture = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     roster = PERSONAS + ([LOCAL_PERSONA] if args.local else [])
-    emitter = Emitter(live=live, usernames=[p["username"] for p in roster])
+    built = build_providers(mock=args.mock, roster=roster)
+    preflight(built, live=live)
 
     if args.review:
         if not args.results:
             raise SystemExit("--review requires --results <file>")
         results = json.loads(Path(args.results).read_text(encoding="utf-8"))
-        state_path = Path("runs") / (Path(args.fixture).stem + "-state.json")
-        state = (
-            json.loads(state_path.read_text(encoding="utf-8"))
-            if state_path.exists()
-            else None
+        check_race_identity(fixture, results, None)
+        pred_path = state_path_for(args.fixture, live)
+        path = pred_path if pred_path.exists() else state_path_for(
+            args.fixture, live, review_only=True
         )
-        if live and state and state.get("review_posted_at") and not args.force_review:
-            raise SystemExit(
-                f"review already posted at {state['review_posted_at']} "
-                "(live mode prints nothing on success, so check the state "
-                "file before re-running; use --force-review to post again)"
-            )
-        built = build_providers(mock=args.mock, roster=roster)
-        preflight(built, live=live)
-        run_review(fixture, results, state, emitter, built=built)
-        if live and state is not None:
-            from datetime import datetime
-
-            state["review_posted_at"] = datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            )
-            state_path.write_text(
-                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+        lock = RaceLock(args.fixture) if live else None
+        if lock:
+            lock.__enter__()
+        try:
+            store = RunState.open(path, fixture, "live" if live else "dryrun")
+            check_race_identity(fixture, None, store.data)
+            emitter = Emitter(live=live, usernames=[p["username"] for p in roster])
+            run_review(fixture, results, store, emitter, built=built,
+                       force=args.force_review)
+        finally:
+            if lock:
+                lock.__exit__()
         return 0
 
-    built = build_providers(mock=args.mock, roster=roster)
-    preflight(built, live=live)
     mc_provider = None
     if args.local and not args.mock:
         mc_provider = providers.OllamaProvider()
-    state = run_prediction(fixture, emitter, built, mc_provider=mc_provider)
-    state_path = Path("runs") / (Path(args.fixture).stem + "-state.json")
-    state_path.parent.mkdir(exist_ok=True)
-    state_path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"\n[state saved: {state_path}]", file=sys.stderr)
+    lock = RaceLock(args.fixture) if live else None
+    if lock:
+        lock.__enter__()
+    try:
+        store = RunState.open(
+            state_path_for(args.fixture, live), fixture,
+            "live" if live else "dryrun",
+        )
+        check_race_identity(fixture, None, store.data)
+        if store.data.get("stage") == "complete" and not args.force:
+            raise SystemExit(
+                "prediction already completed for this race "
+                f"(state: {store.path}); use --force to re-enter — the "
+                "resume logic will still avoid duplicate posts"
+            )
+        emitter = Emitter(live=live, usernames=[p["username"] for p in roster])
+        run_prediction(fixture, emitter, built, store, mc_provider=mc_provider)
+    finally:
+        if lock:
+            lock.__exit__()
+    print(f"\n[state saved: {store.path}]", file=sys.stderr)
     return 0
+
+
 
 
 if __name__ == "__main__":

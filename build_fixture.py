@@ -175,6 +175,7 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
     if info.get("内外"):
         course += f"・{info['内外']}"
     race = {
+        "race_id": race_id,
         "edition": edition,
         "name": info["レース名"],
         "grade": grade,
@@ -260,6 +261,7 @@ def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
     trio = scraper.get_trio_payoff().to_dict("records")[0]
     r = fixture["race"]
     return {
+        "race_id": race_id,
         "race": f"第{r['edition']}回 {r['name']}（{r['grade']}）",
         "date": r["date"],
         "venue": r["venue"],
