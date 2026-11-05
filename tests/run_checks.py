@@ -924,6 +924,126 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         _os.chdir(_cwd_ab)
 
+# --- hashtags on the moderator's posts (2026-11-05) -----------------------
+# Every @shikai note (opener, conclusion, review) ends with one hashtag
+# line: project tag, venue tag, race tag. The line is derived from the
+# fixture alone, so all three stages of one race agree.
+_eliz = json.loads((FIXTURES / "2025-elizabeth-cup.json").read_text(encoding="utf-8"))
+_mon1105 = json.loads((FIXTURES / "2026-monbetsu-1105-12r.json").read_text(encoding="utf-8"))
+_funa1105 = json.loads((FIXTURES / "2026-funabashi-1105-11r.json").read_text(encoding="utf-8"))
+check("tags: line is project + venue + year-race, in order",
+      o.hashtag_line(_eliz) == "#AI競馬予想 #京都競馬場 #2025エリザベス女王杯"
+      and o.hashtag_line(_mon1105) == "#AI競馬予想 #門別競馬場 #2026道営記念"
+      and o.hashtag_line(_funa1105)
+      == "#AI競馬予想 #船橋競馬場 #2026カムイユカラスプリント")
+check("tags: venue tag from the fixture venue (JRA and NAR)",
+      o.venue_hashtag(monbetsu) == "#門別競馬場"
+      and o.venue_hashtag(_eliz) == "#京都競馬場"
+      and o.venue_hashtag(jbc) == "#金沢競馬場")
+
+# Sanitisation of the scraped race names.
+check("tags: bracketed grade badge and glued 重賞 dropped",
+      o._tag_fragment("道営記念〔H1〕重賞") == "道営記念"
+      and o._tag_fragment("カムイユカラスプリント(A2)") == "カムイユカラスプリント"
+      and o._tag_fragment("テスト（G1）") == "テスト")
+check("tags: non-annotation parenthetical content is part of the name",
+      o._tag_fragment("天皇賞(秋)") == "天皇賞秋")
+check("tags: whitespace (half/full width) removed",
+      o._tag_fragment("2歳 未勝利") == "2歳未勝利"
+      and o._tag_fragment("テスト　レース") == "テストレース")
+check("tags: middle dot stripped (would truncate a Misskey hashtag)",
+      o._tag_fragment("テスト・レース") == "テストレース")
+check("tags: unmatched opening bracket truncates the scrape glue",
+      o._tag_fragment("道営スプリント〔H1〕(ソウルラッシュ賞重賞") == "道営スプリント")
+
+# The three @shikai stages of a mock run carry the identical final line;
+# the AIs' own posts do not gain one.
+_gen_tag = o._generate_prediction_texts(
+    monbetsu, o.build_providers(mock=True), points=_snap
+)
+_tag_line = o.hashtag_line(monbetsu)
+check("tags: opener and conclusion end with the tag line",
+      _gen_tag["texts"]["opening"].splitlines()[-1] == _tag_line
+      and _gen_tag["texts"]["conclusion"].splitlines()[-1] == _tag_line)
+check("tags: review ends with the same tag line",
+      o.build_review_text(monbetsu, monbetsu_results, _gen_tag)
+      .splitlines()[-1] == _tag_line)
+check("tags: AI prediction/debate posts carry no hashtag line",
+      all(_tag_line not in t for t in _gen_tag["texts"]["predictions"].values())
+      and all(_tag_line not in t for t in _gen_tag["texts"]["debate"].values()))
+
+# Compatibility: a completed state stored by the OLD code (opener and
+# conclusion posted without tags, note IDs recorded) must review
+# cleanly tomorrow: prediction re-entry posts nothing, the stored texts
+# stay untouched, and exactly one new @shikai note (the review, WITH
+# tags) is emitted; a second review is refused instead of duplicating.
+
+
+class _RecordingEmitter(o.Emitter):
+    def __init__(self):
+        super().__init__(live=False)
+        self.calls: list = []
+
+    def emit(self, username, text, reply_to):
+        self.calls.append((username, text, reply_to))
+        return super().emit(username, text, reply_to)
+
+
+_cwd_tag = _os.getcwd()
+with tempfile.TemporaryDirectory() as td:
+    _os.chdir(td)
+    try:
+        _store_tag = o.RunState.open(
+            o.state_path_for("fixtures/tag-compat.json", False),
+            monbetsu, "dryrun",
+        )
+        _built_tag = o.build_providers(mock=True)
+        o.run_prediction(
+            monbetsu, o.Emitter(live=False), _built_tag, _store_tag
+        )
+        # Downgrade the stored texts to the old format (no tag line),
+        # exactly what the 2026-11-05 live states hold.
+        for _key in ("opening", "conclusion"):
+            _t = _store_tag.data["texts"][_key]
+            assert _t.endswith(_tag_line), _key
+            _store_tag.data["texts"][_key] = _t[: -len(_tag_line)].rstrip("\n")
+        _store_tag.save()
+        _ids_before = json.loads(json.dumps(_store_tag.data["note_ids"]))
+        _texts_before = json.loads(json.dumps(_store_tag.data["texts"]))
+
+        _rec_pred = _RecordingEmitter()
+        o.run_prediction(monbetsu, _rec_pred, _built_tag, _store_tag)
+        check("tags compat: re-entering a completed old state posts nothing",
+              _rec_pred.calls == []
+              and _store_tag.data["note_ids"] == _ids_before
+              and _store_tag.data["texts"] == _texts_before)
+
+        _rec_rev = _RecordingEmitter()
+        o.run_review(
+            monbetsu, synth_results, _store_tag, _rec_rev, built=_built_tag
+        )
+        _mc_notes = [c for c in _rec_rev.calls if c[0] == o.MC_USERNAME]
+        check("tags compat: old state review emits exactly one MC note",
+              len(_mc_notes) == 1
+              and bool((_store_tag.data.get("review") or {}).get("note_id")))
+        check("tags compat: the new review note carries the tag line",
+              _mc_notes[0][1].splitlines()[-1] == _tag_line)
+        check("tags compat: stored old texts were not retro-tagged",
+              o.PROJECT_TAG not in _store_tag.data["texts"]["opening"]
+              and o.PROJECT_TAG not in _store_tag.data["texts"]["conclusion"])
+        try:
+            o.run_review(
+                monbetsu, synth_results, _store_tag,
+                _RecordingEmitter(), built=_built_tag,
+            )
+            _refused = False
+        except SystemExit:
+            _refused = True
+        check("tags compat: a second review is refused, not duplicated",
+              _refused)
+    finally:
+        _os.chdir(_cwd_tag)
+
 # --- full mock dry-run end to end, now with gate + A/B wired in ---
 _cwd_e2e = _os.getcwd()
 with tempfile.TemporaryDirectory() as td:
