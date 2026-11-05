@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -55,6 +56,24 @@ LOCAL_PERSONA = {
 }
 MARKS = ["◎", "○", "▲", "△"]
 MARK_SCORE = {"◎": 4, "○": 3, "▲": 2, "△": 1}
+
+# --- Market anchor, conclusion gate, A/B measurement (2026-11-05) --------
+# Adopted from the prior-art survey (research report §4, items 1/2/4).
+# The closing market is a strong, well-calibrated forecast, so:
+# (1) fixtures carry a de-vigged market win probability per horse, the
+#     prompts ask each AI to justify its win% AS A DEVIATION from the
+#     market, and the market itself votes as one extra ballot;
+# (2) the conclusion account bets only when the panel's aggregate win
+#     probability for its anchor clears the market by EDGE_MARGIN, and
+#     a horse the market prices below LONGSHOT_MIN_MARKET_PROB can
+#     never anchor the conclusion bet (the longshot cap);
+# (4) pre-debate vs post-debate aggregates are scored permanently
+#     (A/B ledger) so the debate's value is measured, not assumed.
+EDGE_MARGIN = 1.15               # aggregate win prob must reach market x this
+LONGSHOT_MIN_MARKET_PROB = 0.02  # anchor needs at least this market prob
+MARKET_USERNAME = "market"       # pseudo-voter carrying the market ballot
+AB_JUDGE_AT_RACES = 200          # the debate default is judged at this count
+AB_STANDINGS_MIN_RACES = 10      # review notes show A/B standings from here
 MARK_RE = re.compile(r"([◎○▲△])\s*(?:馬番)?\s*(\d{1,2})\s*番?\s+([ァ-ヶー・]+)")
 
 SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、他のAIと議論して最終的に一つの結論に収束させる場に参加しています。
@@ -65,6 +84,7 @@ SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、�
 ▲ 馬番 馬名 勝率○% 3着内○% — 理由
 △ 馬番 馬名 勝率○% 3着内○% — 理由
 勝率と3着内率はあなたの推定です。勝率は1〜90%、3着内率は勝率以上99%以下にし、4頭の勝率の合計は100%を超えないでください。人気だけに引きずられず、「勝つ確率が高いのに評価が割れそうな馬」を見抜くことが持ち点を増やす近道です。
+出走馬データに「市場勝率○%」と併記されている数値は、単勝オッズから算出した市場の勝率評価です（併記がないレースでは市場データなし）。あなたの勝率は市場との差（乖離）として捉え、各印の理由では「市場が何を見落としているのか」を、その差の大きさ（ポイント）とともに具体的に述べてください。市場との乖離が大きいほど強い根拠が必要です。根拠が弱い場合は、無理に乖離を作らず市場寄りの評価にしてください。
 印のあとに、あなた自身が馬券を買うならどう買うかも、必ず次の形式で書いてください（券種・組み合わせ・金額を1行に1点。金額は持ち点から賭ける点数で、上限は別途指示されます）:
 【買い目】
 単勝 7 500
@@ -83,9 +103,13 @@ def race_text(fixture: dict, form_limit: int | None = None) -> str:
     for h in fixture["horses"]:
         recent = h["recent_form"][:form_limit] if form_limit else h["recent_form"]
         form = " / ".join(recent)
-        lines.append(
+        line = (
             f"{h['number']} {h['name']}（{h['sex_age']}・{h['weight_kg']}kg・{h['jockey']}・{h['trainer']}厩舎）近走：{form}"
         )
+        mkt = h.get("market") or {}
+        if mkt.get("win_prob") is not None:
+            line += f" / 市場勝率{mkt['win_prob'] * 100:.1f}%（単勝{mkt.get('odds')}倍）"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -107,7 +131,7 @@ BET_SECTION_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?(.*)", re.S)
 
 LOCAL_SYSTEM = """あなたは ローカルLLM（Qwen3） です。競馬予想AIとして、他のAIと議論して最終的に一つの結論に収束させる場に参加しています。
 予想は特定の観点に偏らず、過去の走破内容・騎手・枠順・馬場状態・脚質と想定ペース・近走の勢いを総合的に判断してください。
-出力は指定されたJSON形式のみです。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は持ち点から賭ける点数で、合計は指示された上限以内にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
+出力は指定されたJSON形式のみです。出走データに「市場勝率○%」とある数値は単勝オッズ由来の市場の勝率評価です。各印の理由では、自分の勝率と市場勝率との差（乖離、ポイント）と、その根拠（市場が見落としている情報）を短く述べてください。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は持ち点から賭ける点数で、合計は指示された上限以内にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
 出力例: {"marks": [{"mark": "◎", "number": 7, "win_pct": 30, "top3_pct": 60, "reason": "近走の内容が安定"}, {"mark": "○", "number": 1, "win_pct": 22, "top3_pct": 50, "reason": "コース適性が高い"}, {"mark": "▲", "number": 11, "win_pct": 15, "top3_pct": 40, "reason": "脚質が展開に合う"}, {"mark": "△", "number": 4, "win_pct": 10, "top3_pct": 30, "reason": "人気薄だが一発がある"}], "bets": [{"type": "単勝", "combo": "7", "amount": 500}, {"type": "3連複", "combo": "1-7-11", "amount": 500}], "comment": "全体のまとめを1〜2文で。"}"""
 
 PREDICTION_SCHEMA = {
@@ -210,6 +234,91 @@ def validate_probabilities(
 def fair_odds(win_pct: int) -> float:
     """The odds at which a bet on this horse breaks even at win_pct."""
     return 100.0 / win_pct
+
+
+# --- Market data (the fixture's odds snapshot) ------------------------------
+# build_fixture stamps every horse with a market block {odds, win_prob,
+# snapshot_time}: the win odds published at fixture-build time and the
+# de-vigged win probability derived from them. Before betting opens
+# there are no odds, the block is nulls, and every consumer below must
+# degrade to the pre-market behaviour (no prompt note, no annotation,
+# no market ballot, no conclusion gate).
+
+def fixture_market(fixture: dict) -> dict[int, dict]:
+    """Usable market entries {number: {"odds":…, "win_prob":…}} — only
+    horses whose de-vigged probability is present."""
+    out: dict[int, dict] = {}
+    for h in fixture.get("horses") or []:
+        m = h.get("market") or {}
+        if m.get("win_prob") is not None:
+            out[h["number"]] = {
+                "odds": m.get("odds"),
+                "win_prob": float(m["win_prob"]),
+            }
+    return out
+
+
+def market_win_prob(fixture: dict, number: int) -> float | None:
+    entry = fixture_market(fixture).get(number)
+    return entry["win_prob"] if entry else None
+
+
+def market_ballot_marks(fixture: dict) -> dict | None:
+    """The market's own ballot: ◎○▲△ on the four runners with the
+    highest market win probabilities. None without usable market data
+    (or with fewer than four priced runners)."""
+    market = fixture_market(fixture)
+    if len(market) < 4:
+        return None
+    names = {h["number"]: h["name"] for h in fixture["horses"]}
+    top = sorted(
+        market.items(), key=lambda kv: (-kv[1]["win_prob"], kv[0])
+    )[:4]
+    return {
+        mk: (num, names.get(num, ""))
+        for mk, (num, _entry) in zip(MARKS, top)
+    }
+
+
+def market_prompt_note(fixture: dict) -> str:
+    """The deviation-forecasting instruction appended to prompts when
+    (and only when) the race card carries market probabilities."""
+    if not fixture_market(fixture):
+        return ""
+    return (
+        "\n\n【市場との乖離について】出走データの「市場勝率」は単勝オッズから"
+        "算出した市場の評価です。印を付けた馬については、自分の勝率と市場勝率"
+        "との差（乖離、ポイント）を意識し、その差を正当化する具体的な根拠"
+        "（市場が見落としている情報）を理由の中で数値とともに述べてください。"
+    )
+
+
+_MARKET_ANNOTATION_RE = re.compile(r"市場\s*\d+(?:\.\d+)?\s*%")
+
+
+def annotate_market(text: str, fixture: dict) -> str:
+    """Show the market win% alongside each marked horse's own estimates
+    in a prediction text: '… 3着内60%（市場24%）'. Deterministic and
+    idempotent. The mark lines were validated against PROB_LINE_RE, so
+    splicing the market figure in right after the top-3 estimate keeps
+    every later parser working (they all match the line prefix)."""
+    market = fixture_market(fixture)
+    if not market:
+        return text
+
+    def repl(m: re.Match) -> str:
+        seg = m.group(0)
+        # The annotation lands right AFTER the matched segment, so
+        # idempotency means checking the text that follows the match.
+        following = m.string[m.end():m.end() + 16]
+        if _MARKET_ANNOTATION_RE.search(seg) or following.startswith("（市場"):
+            return seg
+        entry = market.get(int(m.group(2)))
+        if entry is None:
+            return seg
+        return f"{seg}（市場{entry['win_prob'] * 100:.0f}%）"
+
+    return PROB_LINE_RE.sub(repl, text)
 
 
 BET_TYPES: dict[str, tuple[int, bool]] = {
@@ -462,7 +571,11 @@ def generate_structured_prediction(prov, fixture: dict,
                                    balance: int | None = None,
                                    cap: int | None = None) -> str:
     body = race_text(fixture, form_limit=3)
-    user = f"次のレースの予想をしてください。\n\n{body}" + budget_line(balance, cap)
+    user = (
+        f"次のレースの予想をしてください。\n\n{body}"
+        + market_prompt_note(fixture)
+        + budget_line(balance, cap)
+    )
     obj = _structured_with_retry(
         prov, LOCAL_SYSTEM, user, PREDICTION_SCHEMA,
         lambda o: validate_local_prediction(o, fixture, max_total=cap),
@@ -497,40 +610,91 @@ def validate_ballot_obj(obj: object, fixture: dict) -> list[str]:
     return errors + validate_marks(marks, fixture)
 
 
-def render_ballot_block(marks: dict) -> str:
+def render_ballot_block(marks: dict, probs: dict | None = None) -> str:
     """The canonical 【最終票】 block for a validated ballot. The published
     debate text, the saved state, and the aggregation must all carry the
     SAME ballot (re-review 2026-11-04, finding 1: the local AI's prose
-    ballot and its structured ballot could diverge)."""
+    ballot and its structured ballot could diverge). When the ballot's
+    win percentages are known they are rendered with the marks, like
+    the cloud personas' ballot lines."""
     lines = ["【最終票】"]
     for mk in MARKS:
         if mk in marks:
             num, name = marks[mk]
-            lines.append(f"{mk} {num} {name}")
+            pct = f" 勝率{probs[num]}%" if probs and num in probs else ""
+            lines.append(f"{mk} {num} {name}{pct}")
     return "\n".join(lines)
 
 
-def splice_ballot(text: str, marks: dict) -> str:
+def splice_ballot(text: str, marks: dict, probs: dict | None = None) -> str:
     """Replace (or append) the ballot section of a debate text with the
     canonical block rendered from the validated ballot."""
     head = text.rfind("【最終票】")
     base = text[:head].rstrip() if head >= 0 else text.rstrip()
-    return base + "\n\n" + render_ballot_block(marks)
+    return base + "\n\n" + render_ballot_block(marks, probs)
 
 
-def generate_structured_ballot(prov, fixture: dict, context: str) -> dict[str, tuple[int, str]]:
-    """The local LLM's final ballot after the debate, as {mark: (num, name)}
-    with fixture-canonical names."""
+def generate_structured_ballot(prov, fixture: dict, context: str):
+    """The local LLM's final ballot after the debate, as
+    ({mark: (num, name)}, {number: win_pct}) with fixture-canonical
+    names. The ballot schema carries win_pct per mark; percentages are
+    captured when present (older/looser outputs may omit them, and the
+    caller falls back to the initial estimates)."""
     names = {h["number"]: h["name"] for h in fixture["horses"]}
     obj = _structured_with_retry(
         prov, LOCAL_SYSTEM, context, BALLOT_SCHEMA,
         lambda o: validate_ballot_obj(o, fixture),
         "local ballot",
     )
-    return {
+    marks = {
         m["mark"]: (m["number"], names.get(m["number"], ""))
         for m in obj["marks"]
     }
+    probs: dict[int, int] = {}
+    for m in obj["marks"]:
+        win = m.get("win_pct")
+        if isinstance(win, int):
+            probs[m["number"]] = win
+    return marks, probs
+
+
+BALLOT_PROB_RE = re.compile(
+    r"([◎○▲△])\s*(\d{1,2})\s+\S+\s+勝率\s*(\d{1,3})\s*%"
+)
+
+
+def parse_ballot_probs(text: str) -> dict[int, int]:
+    """{number: win_pct} stated in the 【最終票】 section of a debate
+    text. Ballot lines carry win percentages since the market-anchor
+    change; texts without them yield {} and callers fall back."""
+    idx = (text or "").rfind("【最終票】")
+    if idx < 0:
+        return {}
+    out: dict[int, int] = {}
+    for _mk, num, win in BALLOT_PROB_RE.findall(text[idx:]):
+        out.setdefault(int(num), int(win))
+    return out
+
+
+def _resolve_ballot_probs(marks: dict, stated: dict[int, int],
+                          prediction_text: str) -> dict[int, int]:
+    """Win percentages for the final marks, best source first: what the
+    ballot itself stated, then the AI's initial estimate for the same
+    horse, then its initial estimate at the same mark. A mark with no
+    resolvable percentage stays absent — the aggregate builder covers
+    it through the residual probability mass."""
+    init = parse_probabilities(prediction_text)
+    by_number = {num: win for num, win, _t in init.values()}
+    by_mark = {mk: win for mk, (_n, win, _t) in init.items()}
+    out: dict[int, int] = {}
+    for mk, (num, _name) in marks.items():
+        if num in stated:
+            out[num] = stated[num]
+        elif num in by_number:
+            out[num] = by_number[num]
+        elif mk in by_mark:
+            out[num] = by_mark[mk]
+    return out
 
 
 def canonical_marks(text: str, fixture: dict) -> dict[str, tuple[int, str]]:
@@ -887,6 +1051,7 @@ def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
     username = persona["username"]
     system = SYSTEM_TEMPLATE.format(display=persona["display"])
     user = f"次のレースの予想をしてください。\n\n{body}"
+    user += market_prompt_note(fixture)
     user += budget_line(balance, cap)
     text = prov.chat(system, user)
     errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
@@ -911,10 +1076,11 @@ def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
 
 
 def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
-                                predictions: dict, roster: list) -> tuple[str, dict]:
+                                predictions: dict, roster: list):
     """One persona's debate reply plus its validated final ballot, as
-    (debate text, {mark: (number, name)}). Raises _StageFailure with the
-    failing stage on irrecoverable problems, RuntimeError otherwise."""
+    (debate text, {mark: (number, name)}, {number: win_pct}). Raises
+    _StageFailure with the failing stage on irrecoverable problems,
+    RuntimeError otherwise."""
     username = persona["username"]
     others = "\n\n".join(
         f"--- {p['display']} の予想 ---\n{predictions[p['username']]}"
@@ -942,9 +1108,12 @@ def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
         "議論として応答してください。最も同意できる点と最も異論のある点を"
         "具体的に挙げてください。\n"
         "最後に、議論を踏まえたあなたの最終票を必ず次の形式で書いてください"
-        "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にしてください）:\n"
-        "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
-        f"【元の出走データ】\n{prompt_body}\n\n"
+        "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にし、"
+        "各印には議論後のあなたの勝率推定も併記してください）:\n"
+        "【最終票】\n◎ 馬番 馬名 勝率○%\n○ 馬番 馬名 勝率○%\n"
+        "▲ 馬番 馬名 勝率○%\n△ 馬番 馬名 勝率○%\n"
+        + market_prompt_note(fixture)
+        + f"\n\n【元の出走データ】\n{prompt_body}\n\n"
         f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{prompt_others}"
     )
     try:
@@ -961,12 +1130,13 @@ def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
             f"【他のAIの予想（抜粋）】\n{prompt_others}\n\n【自分の議論】\n{text[:800]}"
         )
         try:
-            ballot = generate_structured_ballot(prov, fixture, context)
+            ballot, stated = generate_structured_ballot(prov, fixture, context)
         except Exception as exc:  # noqa: BLE001 - re-raised with stage info
             raise _StageFailure("ballot", f"structured ballot failed: {exc}") from exc
+        probs = _resolve_ballot_probs(ballot, stated, predictions[username])
         # Publish the validated structured ballot, not whatever the
         # free-form debate prose happened to claim (finding 1).
-        return splice_ballot(text, ballot), ballot
+        return splice_ballot(text, ballot, probs), ballot, probs
     marks, errors = _ballot_errors(text, fixture)
     if errors:
         print(f"[ballot retry for {username}: {errors}]", file=sys.stderr)
@@ -975,8 +1145,9 @@ def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
                 system,
                 "最終票だけを出し直してください。前回の問題: "
                 + " / ".join(errors)
-                + "\n次の形式のみで出力してください:\n"
-                "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
+                + "\n次の形式のみで出力してください（各印に勝率も併記）:\n"
+                "【最終票】\n◎ 馬番 馬名 勝率○%\n○ 馬番 馬名 勝率○%\n"
+                "▲ 馬番 馬名 勝率○%\n△ 馬番 馬名 勝率○%\n\n"
                 f"【元の出走データ】\n{body}",
             )
         except Exception as exc:  # noqa: BLE001 - re-raised with stage info
@@ -991,9 +1162,13 @@ def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
         base = text[:head].rstrip() if head >= 0 else text.rstrip()
         text = base + "\n\n" + retry.strip()
     names = {h["number"]: h["name"] for h in fixture["horses"]}
-    return text, {
+    canonical = {
         mk: (num, names.get(num, name)) for mk, (num, name) in marks.items()
     }
+    probs = _resolve_ballot_probs(
+        canonical, parse_ballot_probs(text), predictions[username]
+    )
+    return text, canonical, probs
 
 
 # --- Bet/final-mark reconciliation (2026-11-05) ----------------------------
@@ -1231,6 +1406,137 @@ def _reconcile_bets(fixture: dict, active: list, predictions: dict,
     return final_bets, revisions
 
 
+# --- Aggregate probability vectors + the conclusion gate -------------------
+# Items 2 and 4 share one construction: turn per-AI stated win
+# percentages (which cover only the marked horses) into a full-field
+# probability vector. The Item 2 gate judges the conclusion bet from
+# the post-debate vector; the Item 4 A/B scoring builds the same
+# vector from the initial predictions and from the final ballots and
+# compares the two.
+
+def build_probability_vector(contribs: list[dict], fixture: dict) -> dict[int, float]:
+    """Average full-field win-probability vector (percent) from per-AI
+    stated win percentages {horse number: win%}.
+
+    Each AI states percentages only for its marked horses; its residual
+    mass (100 − stated total) is spread over the horses it did NOT
+    state, proportionally to the market win probability when the
+    fixture has market data, uniformly otherwise. Each AI's vector is
+    normalised to sum to 100, so the average does too."""
+    numbers = [h["number"] for h in fixture["horses"]]
+    market = fixture_market(fixture)
+    vectors: list[dict[int, float]] = []
+    for contrib in contribs:
+        stated = {
+            int(n): float(p) for n, p in (contrib or {}).items()
+            if int(n) in numbers
+        }
+        residual = max(0.0, 100.0 - sum(stated.values()))
+        rest = [n for n in numbers if n not in stated]
+        vec = dict(stated)
+        if rest and residual > 0:
+            weights = {
+                n: (market.get(n) or {}).get("win_prob") or 0.0 for n in rest
+            }
+            wsum = sum(weights.values())
+            if wsum > 0:
+                for n in rest:
+                    vec[n] = residual * weights[n] / wsum
+            else:
+                for n in rest:
+                    vec[n] = residual / len(rest)
+        total = sum(vec.values())
+        if total > 0:
+            vec = {n: v * 100.0 / total for n, v in vec.items()}
+        vectors.append(vec)
+    if not vectors:
+        return {n: 0.0 for n in numbers}
+    return {
+        n: sum(v.get(n, 0.0) for v in vectors) / len(vectors)
+        for n in numbers
+    }
+
+
+def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
+    """Decide whether the conclusion account bets, and on which anchor.
+
+    Returns a JSON-friendly record:
+      "bet"     — the anchor's aggregate win probability reaches
+                  market × EDGE_MARGIN; bet, anchored on `anchor`.
+      "pass"    — 見送り: no clear edge over the market; stake 0.
+      "ungated" — the fixture has no market data, so no gate can be
+                  applied; the caller bets as before and this record
+                  says why (data-missing is recorded, never hidden).
+    The anchor is the aggregate's top horse among those whose market
+    probability is at least LONGSHOT_MIN_MARKET_PROB: a horse the
+    market prices under that floor may top the panel's ranking but
+    may not anchor the conclusion bet (its number is kept in
+    `skipped_longshot` when it was the aggregate's top)."""
+    names = {h["number"]: h["name"] for h in fixture["horses"]}
+    market = fixture_market(fixture)
+    vector = build_probability_vector(contribs, fixture)
+    record: dict = {
+        "edge_margin": EDGE_MARGIN,
+        "longshot_min_market_prob": LONGSHOT_MIN_MARKET_PROB,
+        "aggregate_probs": {
+            str(n): round(p, 2) for n, p in sorted(vector.items())
+        },
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if not market:
+        record.update({
+            "decision": "ungated",
+            "anchor": None,
+            "reason": "市場データがないためゲート未適用",
+        })
+        return record
+    order = sorted(vector.items(), key=lambda kv: (-kv[1], kv[0]))
+    anchor = None
+    for num, _p in order:
+        mp = (market.get(num) or {}).get("win_prob")
+        if mp is not None and mp >= LONGSHOT_MIN_MARKET_PROB:
+            anchor = num
+            break
+    if anchor is None:
+        top = order[0][0] if order else None
+        record.update({
+            "decision": "pass",
+            "anchor": None,
+            "reason": (
+                f"集計首位の {top} {names.get(top, '')} を含め、市場"
+                f"{LONGSHOT_MIN_MARKET_PROB * 100:.0f}%以上の馬がおらず"
+                "アンカーにできる馬がいない"
+            ),
+        })
+        return record
+    agg = vector[anchor]
+    mp_pct = market[anchor]["win_prob"] * 100.0
+    required = mp_pct * EDGE_MARGIN
+    record.update({
+        "anchor": anchor,
+        "aggregate_prob": round(agg, 2),
+        "market_prob": round(mp_pct, 2),
+        "required_prob": round(required, 2),
+        "edge": round(agg / mp_pct, 3) if mp_pct > 0 else None,
+        "skipped_longshot": (
+            order[0][0] if order and order[0][0] != anchor else None
+        ),
+    })
+    head = f"{anchor} {names.get(anchor, '')}: 集計勝率 {agg:.1f}% vs 市場 {mp_pct:.1f}%"
+    if agg >= required:
+        record["decision"] = "bet"
+        record["reason"] = (
+            head + f" × {EDGE_MARGIN}（={required:.1f}%）を上回るため賭ける"
+        )
+    else:
+        record["decision"] = "pass"
+        record["reason"] = (
+            head + f" × {EDGE_MARGIN}（={required:.1f}%）に届かず、"
+            "対市場の優位が不足しているため見送り"
+        )
+    return record
+
+
 def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                                cache: dict | None = None, save=None,
                                points: dict | None = None) -> dict:
@@ -1251,11 +1557,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     succeeded — a re-run reuses them and generates only what is missing.
     """
     if cache is None:
-        cache = {"predictions": {}, "debate": {}, "final_marks": {}}
+        cache = {"predictions": {}, "debate": {}, "final_marks": {},
+                 "final_probs": {}}
     else:
         cache.setdefault("predictions", {})
         cache.setdefault("debate", {})
         cache.setdefault("final_marks", {})
+        cache.setdefault("final_probs", {})
 
     def _save() -> None:
         if save is not None:
@@ -1334,6 +1642,9 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         except Exception as exc:  # noqa: BLE001 - exclusion, not abort
             _exclude(persona, "prediction", f"{type(exc).__name__}: {exc}")
             continue
+        # Posted texts show the market win% next to the AI's own
+        # estimates for its marked horses (deterministic annotation).
+        text = annotate_market(text, fixture)
         predictions[username] = text
         cache["predictions"][username] = text
         _save()
@@ -1346,6 +1657,7 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     # --- debate + final ballots ---
     debate: dict[str, str] = {}
     final_marks: dict[str, dict] = {}
+    final_probs: dict[str, dict] = {}
     for persona, prov in built:
         username = persona["username"]
         if username not in predictions:
@@ -1355,9 +1667,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             final_marks[username] = {
                 mk: tuple(v) for mk, v in cache["final_marks"][username].items()
             }
+            raw_probs = (cache.get("final_probs") or {}).get(username) or {}
+            final_probs[username] = {
+                int(n): int(p) for n, p in raw_probs.items()
+            }
             continue
         try:
-            text, marks = _generate_debate_and_ballot(
+            text, marks, probs = _generate_debate_and_ballot(
                 prov, persona, fixture, body, predictions, built
             )
         except Exception as exc:  # noqa: BLE001 - exclusion, not abort
@@ -1366,9 +1682,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             continue
         debate[username] = text
         final_marks[username] = marks
+        final_probs[username] = probs
         cache["debate"][username] = text
         cache["final_marks"][username] = {
             mk: list(v) for mk, v in marks.items()
+        }
+        cache["final_probs"][username] = {
+            str(n): p for n, p in probs.items()
         }
         _save()
 
@@ -1378,7 +1698,11 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     )
 
     # --- aggregation over the FINAL ballots (initial scores break ties) ---
+    # The market votes as one extra ballot with the same weight as one
+    # AI ballot (Item 1); it has no bets and no points account, and it
+    # is recorded in the state and shown in the conclusion note.
     display_of_all = {p["username"]: p["display"] for p, _ in built}
+    display_of_all[MARKET_USERNAME] = "市場"
 
     def _scores(marks_by_user: dict) -> dict[int, dict]:
         out: dict[int, dict] = {}
@@ -1389,8 +1713,12 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                 entry["marks"][display_of_all.get(username, username)] = mark
         return out
 
+    market_marks = market_ballot_marks(fixture)
     initial_scores = _scores(initial_marks)
-    final_scores = _scores(final_marks)
+    scoring_marks = dict(final_marks)
+    if market_marks:
+        scoring_marks[MARKET_USERNAME] = market_marks
+    final_scores = _scores(scoring_marks)
     ranking = sorted(
         final_scores.items(),
         key=lambda kv: (
@@ -1405,13 +1733,39 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         for p, _ in active
         if final_bets.get(p["username"])
     )
+    # --- the conclusion gate (Item 2): the aggregate probability
+    # vector over the final ballots decides whether the conclusion
+    # account bets at all, and which horse anchors its win leg. An
+    # AI whose ballot percentages are unavailable (e.g. a gen cache
+    # from before they were recorded) contributes its initial
+    # estimates instead, so the gate never runs on an empty panel.
+    init_probs = {
+        u: {num: win for num, win, _t in parse_probabilities(text).values()}
+        for u, text in predictions.items()
+    }
+    contribs: list[dict] = []
+    for persona, _prov in active:
+        u = persona["username"]
+        fp = final_probs.get(u) or init_probs.get(u) or {}
+        contribs.append({int(n): int(p) for n, p in fp.items()})
+    gate = evaluate_conclusion_gate(fixture, contribs)
     final_total = 1000
     if points and MC_USERNAME in points:
         final_total = min(1000, points[MC_USERNAME]["cap"])
-    final_bet = (
-        build_final_bet(ranking, fixture, total=final_total)
-        if final_total > 0 else None
-    )
+    final_bet = None
+    if gate["decision"] != "pass" and final_total > 0 and ranking:
+        bet_ranking = ranking
+        anchor = gate.get("anchor")
+        if (
+            gate["decision"] == "bet"
+            and anchor is not None
+            and ranking[0][0] != anchor
+        ):
+            names = {h["number"]: h["name"] for h in fixture["horses"]}
+            bet_ranking = [
+                (anchor, {"name": names.get(anchor, ""), "score": 0})
+            ] + [entry for entry in ranking if entry[0] != anchor]
+        final_bet = build_final_bet(bet_ranking, fixture, total=final_total)
 
     lines = [f"【最終結論】第{r['edition']}回 {r['name']}", "（討論後の最終票を集計）", ""]
     if ranking:
@@ -1426,6 +1780,15 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             m = final_marks[persona["username"]].get("◎")
             if m:
                 lines.append(f"  {persona['display']}: ◎ {m[0]} {m[1]}")
+        if market_marks:
+            mkt = fixture_market(fixture)
+            lines.append("")
+            lines.append("市場（単勝オッズ）の票：")
+            for mk in MARKS:
+                num, name = market_marks[mk]
+                lines.append(
+                    f"  {mk} {num} {name}（市場勝率{mkt[num]['win_prob'] * 100:.1f}%）"
+                )
         changed = []
         for persona, _ in active:
             before = initial_marks[persona["username"]].get("◎")
@@ -1451,9 +1814,16 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             honmei = initial_marks[persona["username"]].get("◎")
             p0 = probs.get("◎")
             if honmei and p0:
+                dev = ""
+                mp = market_win_prob(fixture, honmei[0])
+                if mp is not None:
+                    dev = (
+                        f"・市場{mp * 100:.1f}%"
+                        f"（乖離{p0[1] - mp * 100:+.0f}pt）"
+                    )
                 fair_lines.append(
                     f"  {persona['display']}: ◎ {honmei[0]} {honmei[1]} "
-                    f"勝率{p0[1]}%（フェアオッズ {fair_odds(p0[1]):.1f}倍相当）"
+                    f"勝率{p0[1]}%{dev}（フェアオッズ {fair_odds(p0[1]):.1f}倍相当）"
                 )
         if fair_lines:
             lines.append("")
@@ -1503,6 +1873,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         )
     if final_bet:
         conclusion += "\n\n【最終買い目（結論口座）】\n" + format_bets(final_bet)
+        if gate["decision"] == "bet":
+            conclusion += f"\n（結論口座の対市場判定: {gate['reason']}）"
+    elif gate["decision"] == "pass":
+        conclusion += (
+            "\n\n【結論口座】見送り（このレースは賭けません）"
+            f"\n理由: {gate['reason']}"
+        )
     if points:
         display_of = {p["username"]: p["display"] for p, _ in built}
         display_of[MC_USERNAME] = "結論口座"
@@ -1542,6 +1919,21 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         "bet_revisions": bet_revisions,
         "excluded": excluded,
         "final_bet": format_bets(final_bet) if final_bet else None,
+        # Market anchor (Item 1): the market's own ballot, recorded so
+        # reviews can show what the odds said. No bets, no account.
+        "market_ballot": (
+            {"marks": serialize({MARKET_USERNAME: market_marks})[MARKET_USERNAME]}
+            if market_marks else None
+        ),
+        # Ballot win percentages per AI (Item 2/4 inputs), keyed by
+        # horse number as a string for JSON.
+        "final_probs": {
+            u: {str(n): p for n, p in probs.items()}
+            for u, probs in final_probs.items()
+        },
+        # The conclusion gate record (Item 2): decision, anchor,
+        # aggregate vs market numbers, and the full aggregate vector.
+        "conclusion_gate": gate,
     }
 
 
@@ -1562,7 +1954,8 @@ def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
             ledger.ensure_bettable(u, race_id)
         snap = ledger.snapshot(usernames)
         cache = d.setdefault(
-            "gen", {"predictions": {}, "debate": {}, "final_marks": {}}
+            "gen", {"predictions": {}, "debate": {}, "final_marks": {},
+                    "final_probs": {}}
         )
         generated = _generate_prediction_texts(
             fixture, built, mc_provider=mc_provider,
@@ -1709,6 +2102,11 @@ def build_review_text(fixture: dict, results: dict, state: dict | None) -> str:
                 )
     else:
         lines.append("（予想スレッドの記録がないため、結果のみの回顧です）")
+    gate = (state or {}).get("conclusion_gate") or {}
+    if gate.get("decision") == "pass":
+        lines.append(
+            f"結論口座は見送りでした（{gate.get('reason', '対市場の優位が不足')}）。"
+        )
     ev = ev_summary(fixture, results, state)
     if ev:
         lines.append("")
@@ -1744,6 +2142,12 @@ def build_review_text(fixture: dict, results: dict, state: dict | None) -> str:
                     for i, (u, b) in enumerate(order)
                 )
             )
+    ab_line = ab_standings_text(
+        ((state.get("review") or {}).get("ab") or {}).get("totals")
+    )
+    if ab_line:
+        lines.append("")
+        lines.append(ab_line)
     lines.append("次回の予想に活かします。")
     return "\n".join(lines)
 
@@ -1871,6 +2275,14 @@ def settle_race_points(fixture: dict, results: dict, state: dict,
             race_id, race_name, MC_USERNAME,
             sum(b["amount"] for b in bets), total_return,
         )
+    elif (state.get("conclusion_gate") or {}).get("decision") == "pass":
+        # 見送り (Item 2 gate): the conclusion account staked nothing.
+        # Record a zero-stake settlement so the pass is on the ledger
+        # and in the review's standings without moving any balance;
+        # idempotent like every other settlement.
+        records[MC_USERNAME] = ledger.settle(
+            race_id, race_name, MC_USERNAME, 0, 0
+        )
     return records
 
 
@@ -1901,6 +2313,239 @@ def ev_summary(fixture: dict, results: dict, state: dict) -> dict[str, list[dict
         if rows:
             out[username] = rows
     return out
+
+
+# --- A/B measurement: pre-debate vs post-debate aggregates (Item 4) --------
+# Every settled points-era race scores three predictors against the
+# actual result: PRE (the aggregate built from the initial
+# predictions), POST (the aggregate built from the final ballots) and
+# CONCL (the conclusion as posted). PRE/POST carry full-field
+# probability vectors (build_probability_vector), so they are scored
+# by log-loss against the winner and by the ROI of a flat 100-point
+# win bet on their top pick. CONCL's ranking is a mark-score aggregate
+# (final ballots + the market ballot), NOT a probability vector, so
+# CONCL is scored by its bet outcome only: a flat 100-point win bet on
+# its anchor pick — or "no bet" (roi None) when the Item 2 gate passed
+# the race. Records live in runs/ab-ledger.json (dry runs:
+# runs/dryrun/ab-ledger.json), keyed by race_id, so re-running a
+# review never double-counts. Review notes carry the standings once
+# AB_STANDINGS_MIN_RACES races are recorded; whether the conclusion
+# bet should default to the PRE aggregate is the user's decision at
+# AB_JUDGE_AT_RACES races — until then this is measurement only and
+# the conclusion keeps using the post-debate ballots.
+
+def ab_ledger_path(live: bool) -> Path:
+    return (
+        Path("runs/ab-ledger.json") if live
+        else Path("runs/dryrun/ab-ledger.json")
+    )
+
+
+class ABLedger:
+    """Per-race A/B records with running totals, mirroring the points
+    ledger's file discipline. A missing file starts empty; a corrupt
+    file starts fresh (stderr note + a flag in the data) — measurement
+    must never break settlement or a review."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.recovered = False
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("races"), dict
+                ):
+                    raise ValueError("unexpected A/B ledger shape")
+                self.data = data
+            except (ValueError, OSError) as exc:
+                print(
+                    f"[A/B ledger at {self.path} unreadable ({exc}); "
+                    "starting fresh]",
+                    file=sys.stderr,
+                )
+                self.data = {
+                    "version": 1,
+                    "races": {},
+                    "recovered_from_corrupt": True,
+                }
+                self.recovered = True
+        else:
+            self.data = {"version": 1, "races": {}}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(self.path)
+
+    def record(self, record: dict) -> dict:
+        """Store one race's record. Idempotent per race_id: a second
+        call returns the stored record unchanged."""
+        rid = record["race_id"]
+        if rid in self.data["races"]:
+            return self.data["races"][rid]
+        self.data["races"][rid] = record
+        self.save()
+        return record
+
+    def totals(self) -> dict:
+        recs = list(self.data["races"].values())
+
+        def _mean(values: list) -> float | None:
+            vals = [v for v in values if v is not None]
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        out: dict = {"n": len(recs)}
+        for side in ("pre", "post"):
+            out[f"{side}_log_loss"] = _mean(
+                [(r.get(side) or {}).get("log_loss") for r in recs]
+            )
+            out[f"{side}_roi"] = _mean(
+                [(r.get(side) or {}).get("roi") for r in recs]
+            )
+        concl_rois = [
+            (r.get("concl") or {}).get("roi") for r in recs
+        ]
+        out["concl_roi"] = _mean(concl_rois)
+        out["concl_bets"] = sum(1 for v in concl_rois if v is not None)
+        out["concl_passes"] = sum(
+            1 for r in recs
+            if (r.get("concl") or {}).get("decision") == "pass"
+        )
+        return out
+
+
+def _flat_win_roi(pick: int | None, winner: int,
+                  odds_map: dict) -> float | None:
+    """Return ratio (payout / stake) of a flat win bet on `pick` at
+    closing odds: the odds themselves on a hit, 0.0 on a miss, None
+    when the bet cannot be priced."""
+    if pick is None:
+        return None
+    if pick != winner:
+        return 0.0
+    odds = odds_map.get(pick)
+    return float(odds) if odds else None
+
+
+def _score_vector(vector: dict, winner: int, odds_map: dict) -> dict:
+    """Log-loss of a full-field probability vector (percent) against
+    the actual winner, plus the flat-bet ROI of its top pick."""
+    if not vector:
+        return {"pick": None, "log_loss": None, "roi": None}
+    pick = max(vector.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    p = max(vector.get(winner, 0.0) / 100.0, 1e-6)
+    return {
+        "pick": pick,
+        "log_loss": round(-math.log(p), 4),
+        "roi": _flat_win_roi(pick, winner, odds_map),
+    }
+
+
+def score_ab_race(fixture: dict, results: dict, state: dict) -> dict:
+    """Build this race's A/B record — or {"skipped": reason} when the
+    state lacks what scoring needs. States saved before final_probs
+    existed (e.g. the 2026-11-05 Monbetsu/Funabashi live states) skip
+    cleanly: their reviews proceed without A/B rather than crashing."""
+    finish = results.get("finish") or []
+    if not finish:
+        return {"skipped": "結果の着順表がありません"}
+    winner = finish[0]["number"]
+    odds_map = {f["number"]: f.get("win_odds") for f in finish}
+    texts = (state.get("texts") or {}).get("predictions") or {}
+    initial_marks = state.get("initial_marks") or {}
+    final_probs = state.get("final_probs") or {}
+    if not texts or not initial_marks:
+        return {"skipped": "初期予想の記録がない旧形式stateのためA/B対象外"}
+    if not final_probs:
+        return {"skipped": "最終票の勝率が記録されていない旧形式stateのためA/B対象外"}
+    pre_contribs = []
+    for username in initial_marks:
+        probs = parse_probabilities(texts.get(username, ""))
+        pre_contribs.append(
+            {num: win for num, win, _t in probs.values()}
+        )
+    post_contribs = [
+        {int(n): int(p) for n, p in (final_probs.get(u) or {}).items()}
+        for u in (state.get("final_marks") or state.get("marks") or {})
+    ]
+    gate = state.get("conclusion_gate") or {}
+    ranking = state.get("conclusion_ranking") or []
+    top = ranking[0]["number"] if ranking else None
+    if gate.get("decision") == "pass":
+        concl = {
+            "pick": gate.get("anchor") or top,
+            "decision": "pass",
+            "roi": None,
+        }
+    elif gate.get("decision") == "bet":
+        pick = gate.get("anchor") or top
+        concl = {
+            "pick": pick,
+            "decision": "bet",
+            "roi": _flat_win_roi(pick, winner, odds_map),
+        }
+    elif state.get("final_bet"):
+        concl = {
+            "pick": top,
+            "decision": "ungated",
+            "roi": _flat_win_roi(top, winner, odds_map),
+        }
+    else:
+        concl = {"pick": top, "decision": "none", "roi": None}
+    return {
+        "race_id": fixture_race_id(fixture) or state.get("race_id") or "",
+        "race": state.get("race") or "",
+        "winner": winner,
+        "market_missing": not bool(fixture_market(fixture)),
+        "pre": _score_vector(
+            build_probability_vector(pre_contribs, fixture), winner, odds_map
+        ),
+        "post": _score_vector(
+            build_probability_vector(post_contribs, fixture), winner, odds_map
+        ),
+        "concl": concl,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def record_ab_for_race(fixture: dict, results: dict, state: dict,
+                       live: bool) -> dict:
+    """Score this race into the A/B ledger (idempotent per race) and
+    return {"record":…, "totals":…} for the state's review section, or
+    {"skipped": reason} for states that cannot be scored."""
+    scored = score_ab_race(fixture, results, state)
+    if "skipped" in scored:
+        return scored
+    ledger = ABLedger(ab_ledger_path(live))
+    record = ledger.record(scored)
+    return {"record": record, "totals": ledger.totals()}
+
+
+def ab_standings_text(totals: dict | None) -> str | None:
+    """The compact A/B standings line for review notes; None until at
+    least AB_STANDINGS_MIN_RACES races are recorded."""
+    if not totals or totals.get("n", 0) < AB_STANDINGS_MIN_RACES:
+        return None
+
+    def _ll(x) -> str:
+        return f"{x:.3f}" if x is not None else "—"
+
+    def _pct(x) -> str:
+        return f"{x * 100:.0f}%" if x is not None else "—"
+
+    return (
+        f"【討論のA/B測定】{totals['n']}レース時点: "
+        f"log-loss 討論前 {_ll(totals.get('pre_log_loss'))} / "
+        f"討論後 {_ll(totals.get('post_log_loss'))}、"
+        f"単勝回収率 討論前 {_pct(totals.get('pre_roi'))} / "
+        f"討論後 {_pct(totals.get('post_roi'))}"
+        f"（結論の賭け方針の判定は{AB_JUDGE_AT_RACES}レースで実施）"
+    )
 
 
 def run_review(
@@ -1950,6 +2595,19 @@ def run_review(
         review["standings"] = {
             u: points_ledger.balance(u) for u in points_ledger.data["accounts"]
         }
+        store.save()
+
+    # A/B measurement (Item 4), recorded before the review note is
+    # built so the note can carry the standings line. Points-era
+    # states only; idempotent per race; legacy states record a skip
+    # reason. Measurement must never break a review, hence the guard.
+    if (state.get("points") or {}).get("enabled") and "ab" not in review:
+        try:
+            review["ab"] = record_ab_for_race(
+                fixture, results, state, live=emitter.live
+            )
+        except Exception as e:  # noqa: BLE001 - measurement only
+            review["ab"] = {"skipped": f"A/B記録に失敗しました: {e}"}
         store.save()
 
     ledger: dict = review.setdefault("reflections", {})

@@ -344,9 +344,12 @@ class MockProvider(BaseProvider):
                         ballot.remove(own_pair)
                     ballot.insert(0, own_pair)
                     ballot = ballot[:4]
+                ballot_probs = [30, 22, 15, 10]
                 text += "\n\n【最終票】\n" + "\n".join(
-                    f"{mark} {num} {name}"
-                    for mark, (num, name) in zip(self._MARKS, ballot)
+                    f"{mark} {num} {name} 勝率{win}%"
+                    for mark, (num, name), win in zip(
+                        self._MARKS, ballot, ballot_probs
+                    )
                 )
             return text
         if not horses:

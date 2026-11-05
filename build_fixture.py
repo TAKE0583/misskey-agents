@@ -4,7 +4,11 @@
 Replaces the JRDB plan (JRDB is a paid service): race entries come from
 EntryPageScraper, recent form from the public shutuba_past page (parsed
 with pandas.read_html), and results/payouts from ResultPageScraper.
-Output matches the hand-built fixture schema used by orchestrator.py.
+Each horse also gets a `market` block (current win odds + de-vigged
+win probability + snapshot time) from the netkeiba odds API; before
+betting opens the odds do not exist and the block is nulls, which the
+orchestrator treats as "no market data". Output matches the hand-built
+fixture schema used by orchestrator.py.
 
 Usage (venv python):
   .venv/bin/python build_fixture.py --race-id 200906050810 \
@@ -105,6 +109,72 @@ def fetch_recent_form(race_id: str, nar: bool = False) -> dict[int, list[str]]:
     return form
 
 
+def parse_win_odds(payload: object) -> dict[int, float]:
+    """Extract {horse number: win odds} from a netkeiba odds API payload
+    (the same JSON shape the vendor odds parser reads: data.odds["1"]
+    maps horse number -> [odds, ?, popularity]). Anything unexpected —
+    including the empty payload served before betting opens — yields
+    an empty dict rather than an error."""
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    tan = (data.get("odds") or {}).get("1") or {}
+    out: dict[int, float] = {}
+    for num, vals in tan.items():
+        try:
+            odds = float(vals[0])
+            number = int(num)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if odds > 0:  # negative values mark scratched/excluded runners
+            out[number] = odds
+    return out
+
+
+def devig_win_probs(odds_by_number: dict[int, float]) -> dict[int, float]:
+    """De-vigged market win probabilities: implied probabilities
+    (1 / odds) normalised to sum to 1 across the field. Odds of 1.0 or
+    below carry no usable implied probability and are left out."""
+    implied = {
+        n: 1.0 / o for n, o in odds_by_number.items() if o and o > 1.0
+    }
+    total = sum(implied.values())
+    if total <= 0:
+        return {}
+    return {n: v / total for n, v in implied.items()}
+
+
+def fetch_win_odds(race_id: str, nar: bool = False) -> dict[int, float]:
+    """Current win odds from the netkeiba odds API. Best-effort by
+    design: odds legitimately do not exist yet for races priced before
+    betting opens (e.g. a Sunday G1 built on Thursday), and a fixture
+    must build fine without them — any failure returns {} and the
+    caller stamps null market fields. The NAR host's API endpoint name
+    could not be verified offline, so both candidate names are tried
+    and whichever answers with data wins."""
+    if nar:
+        urls = [
+            f"{NAR_RACE_URL}/api/api_get_nar_odds.html?race_id={race_id}&type=1",
+            f"{NAR_RACE_URL}/api/api_get_jra_odds.html?race_id={race_id}&type=1",
+        ]
+    else:
+        urls = [
+            f"{JRA_RACE_URL}/api/api_get_jra_odds.html?race_id={race_id}&type=1"
+        ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            odds = parse_win_odds(resp.json())
+        except Exception:  # noqa: BLE001 - odds are optional input
+            continue
+        if odds:
+            return odds
+    return {}
+
+
 def nar_race_info(soup: BeautifulSoup, race_id: str, field_size: int) -> dict:
     """Extract the same info dict shape as EntryPageScraper.get_race_info
     from a nar.netkeiba.com shutuba page, whose markup differs from JRA's."""
@@ -170,6 +240,14 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
     else:
         info = scraper.get_race_info().to_dict("records")[0]
     form = fetch_recent_form(race_id, nar=nar)
+    # Market snapshot: current win odds -> de-vigged win probabilities.
+    # Legitimately empty before betting opens; the nulls then degrade
+    # every downstream consumer to the pre-market behaviour.
+    win_odds = fetch_win_odds(race_id, nar=nar)
+    market_probs = devig_win_probs(win_odds)
+    snapshot_time = (
+        time.strftime("%Y-%m-%dT%H:%M:%S%z") if win_odds else None
+    )
 
     course = f"{info['芝ダ']}・{info['左右']}"
     if info.get("内外"):
@@ -202,6 +280,11 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
             "jockey": row["騎手"],
             "trainer": row["厩舎"],
             "recent_form": form.get(number, []),
+            "market": {
+                "odds": win_odds.get(number),
+                "win_prob": market_probs.get(number),
+                "snapshot_time": snapshot_time,
+            },
         })
     return {"race": race, "horses": horses}
 
@@ -352,6 +435,13 @@ def main() -> int:
         json.dumps(fixture, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"fixture: {args.out} ({len(fixture['horses'])} horses)")
+    with_odds = sum(
+        1 for h in fixture["horses"] if (h.get("market") or {}).get("odds")
+    )
+    if with_odds:
+        print(f"market odds: snapshot for {with_odds} horses")
+    else:
+        print("market odds: not available yet (betting not open?)")
     time.sleep(1)
     if args.results_out:
         results = build_results(args.race_id, fixture, nar=args.nar)

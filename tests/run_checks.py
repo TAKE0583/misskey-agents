@@ -668,6 +668,290 @@ with tempfile.TemporaryDirectory() as td:
           _recs_fb["chatgpt"]["staked"] == 1000
           and _recs_fb["chatgpt"]["returned"] == 2900)
 
+# --- Market anchor, conclusion gate, A/B measurement ---------------------
+# (2026-11-05, prior-art items 1/2/4: the fixture carries de-vigged
+# market probabilities, the market votes as an extra ballot, the
+# conclusion account is gated on an aggregate edge over the market,
+# and pre- vs post-debate aggregates are scored permanently.)
+
+try:
+    import build_fixture as _bf
+except ImportError:  # system python lacks the scraping deps (bs4, ...)
+    _bf = None
+
+if _bf is not None:
+    _dv = _bf.devig_win_probs({1: 2.0, 2: 4.0, 3: 4.0})
+    check("devig: probabilities normalise to 1",
+          abs(sum(_dv.values()) - 1.0) < 1e-9 and abs(_dv[1] - 0.5) < 1e-9)
+    check("devig: unusable odds yield no probabilities",
+          _bf.devig_win_probs({1: 0.0, 2: -3.0}) == {}
+          and _bf.devig_win_probs({}) == {})
+    check("odds api: win odds parsed, junk skipped",
+          _bf.parse_win_odds(
+              {"data": {"odds": {"1": {"7": ["2.9", "0", "1"], "3": ["---"]}}}})
+          == {7: 2.9})
+    check("odds api: pre-sale payload is empty, not an error",
+          _bf.parse_win_odds({"data": ""}) == {}
+          and _bf.parse_win_odds({}) == {})
+else:
+    print("SKIP odds checks (build_fixture needs the venv python)")
+
+import copy as _copy
+
+_names = {h["number"]: h["name"] for h in monbetsu["horses"]}
+
+
+def _stamp_market(fx, odds):
+    tot = sum(1.0 / x for x in odds.values())
+    for h in fx["horses"]:
+        od = odds.get(h["number"])
+        h["market"] = {
+            "odds": od,
+            "win_prob": (1.0 / od / tot) if od else None,
+            "snapshot_time": "2026-11-05T12:00:00+0900",
+        }
+    return fx
+
+
+check("market: no market data without the odds snapshot",
+      o.fixture_market(monbetsu) == {}
+      and o.market_ballot_marks(monbetsu) is None)
+
+_bet_fx = _stamp_market(
+    _copy.deepcopy(monbetsu),
+    {**{n: 30.0 for n in _names}, 10: 8.0, 2: 3.0, 4: 5.0, 1: 6.0},
+)
+_mb = o.market_ballot_marks(_bet_fx)
+check("market ballot: top four by market probability",
+      [_mb[m][0] for m in o.MARKS] == [2, 4, 1, 10])
+check("market: race text carries the market win%",
+      "市場勝率" in o.race_text(_bet_fx))
+_ann = o.annotate_market(text_ok, _bet_fx)
+check("market: annotation shows market% next to own% and stays valid",
+      "（市場" in _ann and o.prediction_errors(_ann, _bet_fx) == [])
+check("market: annotation is idempotent",
+      o.annotate_market(_ann, _bet_fx) == _ann)
+check("ballot probs: parsed from the final-ballot section",
+      o.parse_ballot_probs(
+          "議論。\n\n【最終票】\n◎ 10 タイムエッジ 勝率35%\n○ 4 ダムドローズ 勝率20%")
+      == {10: 35, 4: 20})
+
+_vec = o.build_probability_vector([{10: 40, 4: 20}], _bet_fx)
+check("vector: full-field, sums to 100, residual follows the market",
+      abs(sum(_vec.values()) - 100.0) < 1e-6
+      and abs(_vec[10] - 40.0) < 1e-6 and _vec[2] > _vec[3])
+
+
+class _FixedStub:
+    """Cloud stub with a fixed prediction and a fixed final ballot
+    (marks never move, so no bets reconciliation is triggered)."""
+    name = "fixed"
+
+    def __init__(self, pred, ballot):
+        self.pred = pred
+        self.ballot = ballot
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        if "次のレースの予想をしてください" in user:
+            return self.pred
+        return self.ballot
+
+
+def _pred_text(mp, bets):
+    lines = [
+        f"{mk} {n} {_names[n]} 勝率{w}% 3着内{t}% — 理由。"
+        for mk, n, w, t in mp
+    ]
+    return "\n".join(lines + ["", "【買い目】"] + bets)
+
+
+def _ballot_text(mp):
+    lines = ["議論しました。結論は変わりません。", "", "【最終票】"]
+    lines += [f"{mk} {n} {_names[n]} 勝率{w}%" for mk, n, w, t in mp]
+    return "\n".join(lines)
+
+
+def _fixed_gen(fx, mp, bets, count=2):
+    built = [
+        ({"username": f"fixed{i}", "display": f"固定{i}"},
+         _FixedStub(_pred_text(mp, bets), _ballot_text(mp)))
+        for i in range(count)
+    ]
+    return o._generate_prediction_texts(fx, built)
+
+
+def _state_of(gen):
+    return {
+        "race": gen["race"],
+        "race_id": monbetsu["race"]["race_id"],
+        "texts": gen["texts"],
+        "initial_marks": gen["initial_marks"],
+        "final_marks": gen["final_marks"],
+        "final_probs": gen["final_probs"],
+        "final_bets": gen["final_bets"],
+        "conclusion_ranking": gen["conclusion_ranking"],
+        "conclusion_gate": gen["conclusion_gate"],
+        "final_bet": gen["final_bet"],
+        "points": {"enabled": True},
+    }
+
+
+# gate -> bet: the panel's 35% on #10 vs the market's ~11.5%
+_mp_bet = [("◎", 10, 35, 55), ("○", 4, 20, 45), ("▲", 1, 15, 40), ("△", 2, 10, 30)]
+_gen_mkt = _fixed_gen(_bet_fx, _mp_bet, ["単勝 10 400点", "3連複 1-4-10 600点"])
+_gate = _gen_mkt["conclusion_gate"]
+check("gate: a clear edge over the market bets, anchored on the panel top",
+      _gate["decision"] == "bet" and _gate["anchor"] == 10
+      and _gen_mkt["final_bet"].startswith("単勝 10"))
+check("market ballot: recorded in state and shown in the conclusion",
+      _gen_mkt["market_ballot"]["marks"]["◎"][0] == 2
+      and "市場（単勝オッズ）の票" in _gen_mkt["texts"]["conclusion"])
+check("market: ballot win percentages are recorded per AI",
+      _gen_mkt["final_probs"]["fixed0"].get("10") == 35)
+with tempfile.TemporaryDirectory() as td:
+    _led_m = points_mod.PointsLedger(Path(td) / "points.json")
+    _recs_m = o.settle_race_points(
+        _bet_fx, synth_results, _state_of(_gen_mkt), _led_m
+    )
+    check("market ballot: no points account and never settled",
+          "market" not in _recs_m
+          and "market" not in _led_m.data["accounts"]
+          and set(_recs_m) == {"fixed0", "fixed1", "shikai"})
+
+# gate -> pass: the panel agrees with the market (30% vs ~31.7%)
+_pass_fx = _stamp_market(
+    _copy.deepcopy(monbetsu),
+    {**{n: 25.0 for n in _names}, 10: 2.5, 2: 4.0, 4: 6.0, 1: 8.0},
+)
+_mp_pass = [("◎", 10, 30, 55), ("○", 2, 20, 45), ("▲", 4, 15, 40), ("△", 1, 10, 30)]
+_gen_pass = _fixed_gen(_pass_fx, _mp_pass, ["単勝 10 400点", "3連複 1-2-10 600点"])
+check("gate: agreement with the market is not an edge -> pass",
+      _gen_pass["conclusion_gate"]["decision"] == "pass"
+      and _gen_pass["final_bet"] is None
+      and "見送り" in _gen_pass["texts"]["conclusion"])
+with tempfile.TemporaryDirectory() as td:
+    _led_p = points_mod.PointsLedger(Path(td) / "points.json")
+    _recs_p = o.settle_race_points(
+        _pass_fx, synth_results, _state_of(_gen_pass), _led_p
+    )
+    check("gate: a pass settles as a clean zero-stake record",
+          _recs_p["shikai"]["staked"] == 0
+          and _recs_p["shikai"]["returned"] == 0
+          and _led_p.balance("shikai") == 10000)
+    _recs_p2 = o.settle_race_points(
+        _pass_fx, synth_results, _state_of(_gen_pass), _led_p
+    )
+    check("gate: the pass settlement is idempotent",
+          _recs_p2["shikai"]["balance"] == 10000)
+
+# gate -> longshot cap: the panel's top (#3 at 45%) is priced ~1% by
+# the market, so the next eligible horse (#10) anchors instead
+_long_fx = _stamp_market(
+    _copy.deepcopy(monbetsu),
+    {**{n: 20.0 for n in _names}, 3: 80.0, 10: 3.0, 2: 4.5, 4: 6.0, 1: 7.0},
+)
+_mp_long = [("◎", 3, 45, 70), ("○", 10, 35, 60), ("▲", 2, 10, 30), ("△", 4, 5, 20)]
+_gen_long = _fixed_gen(
+    _long_fx, _mp_long, ["単勝 3 400点", "3連複 2-3-10 600点"], count=4
+)
+_gate_l = _gen_long["conclusion_gate"]
+check("gate: longshot top is skipped, next eligible horse anchors the bet",
+      _gate_l["decision"] == "bet" and _gate_l["anchor"] == 10
+      and _gate_l["skipped_longshot"] == 3
+      and _gen_long["conclusion_ranking"][0]["number"] == 3
+      and _gen_long["final_bet"].startswith("単勝 10"))
+
+# gate -> ungated: the plain Monbetsu fixture has no market data
+_gen_nomkt = o._generate_prediction_texts(monbetsu, o.build_providers(mock=True))
+check("gate: missing market data bets ungated and records it",
+      _gen_nomkt["conclusion_gate"]["decision"] == "ungated"
+      and _gen_nomkt["final_bet"] is not None
+      and _gen_nomkt["market_ballot"] is None)
+
+# --- A/B scoring ---
+_ab_state = _state_of(_gen_mkt)
+_scored = o.score_ab_race(_bet_fx, synth_results, _ab_state)
+check("ab: a settled race scores pre/post/concl",
+      "skipped" not in _scored
+      and _scored["pre"]["log_loss"] is not None
+      and _scored["post"]["pick"] == 10
+      and _scored["concl"]["decision"] == "bet"
+      and _scored["concl"]["roi"] == 0.0)  # #10 lost; the winner was #2
+
+_legacy_ab = {
+    "texts": {"predictions": {"chatgpt": text_ok}},
+    "initial_marks": {"chatgpt": {"◎": [10, "タイムエッジ"]}},
+}
+check("ab: legacy state without final_probs skips safely",
+      "skipped" in o.score_ab_race(monbetsu, monbetsu_results, _legacy_ab)
+      and "skipped" in o.record_ab_for_race(
+          monbetsu, monbetsu_results, _legacy_ab, live=False))
+
+_cwd_ab = _os.getcwd()
+with tempfile.TemporaryDirectory() as td:
+    _os.chdir(td)
+    try:
+        _out1 = o.record_ab_for_race(_bet_fx, synth_results, _ab_state, live=False)
+        check("ab: the record lands in the dry-run ledger",
+              Path("runs/dryrun/ab-ledger.json").exists()
+              and _out1["totals"]["n"] == 1)
+        _out2 = o.record_ab_for_race(_bet_fx, synth_results, _ab_state, live=False)
+        check("ab: re-recording the same race does not double-count",
+              _out2["totals"]["n"] == 1)
+        _abl = o.ABLedger(o.ab_ledger_path(False))
+        for i in range(9):
+            _abl.record({
+                "race_id": f"dummy-{i}", "race": "ダミー", "winner": 1,
+                "pre": {"pick": 1, "log_loss": 2.0, "roi": 0.5},
+                "post": {"pick": 1, "log_loss": 1.8, "roi": 0.6},
+                "concl": {"pick": 1, "decision": "bet", "roi": 0.4},
+            })
+        _totals10 = _abl.totals()
+        _line10 = o.ab_standings_text(_totals10)
+        check("ab: standings appear at 10 races and cite the judge point",
+              _totals10["n"] == 10 and _line10 is not None
+              and "200" in _line10)
+        _state_line = dict(_ab_state)
+        _state_line["review"] = {"ab": {"totals": _totals10}}
+        check("ab: the review note carries the standings line",
+              "【討論のA/B測定】" in o.build_review_text(
+                  _bet_fx, synth_results, _state_line))
+        _abl_path = o.ab_ledger_path(False)
+        _abl_path.write_text("{ not json", encoding="utf-8")
+        _abl2 = o.ABLedger(_abl_path)
+        check("ab: a corrupt ledger starts fresh instead of breaking",
+              _abl2.recovered and _abl2.totals()["n"] == 0)
+    finally:
+        _os.chdir(_cwd_ab)
+
+# --- full mock dry-run end to end, now with gate + A/B wired in ---
+_cwd_e2e = _os.getcwd()
+with tempfile.TemporaryDirectory() as td:
+    _os.chdir(td)
+    try:
+        _store_e2e = o.RunState.open(
+            o.state_path_for("fixtures/e2e-mock.json", False),
+            monbetsu, "dryrun",
+        )
+        _built_e2e = o.build_providers(mock=True)
+        o.run_prediction(
+            monbetsu, o.Emitter(live=False), _built_e2e, _store_e2e
+        )
+        check("e2e: mock prediction completes (ungated, no market data)",
+              _store_e2e.data["stage"] == "complete"
+              and _store_e2e.data["conclusion_gate"]["decision"] == "ungated")
+        o.run_review(
+            monbetsu, synth_results, _store_e2e,
+            o.Emitter(live=False), built=_built_e2e,
+        )
+        _review_e2e = _store_e2e.data.get("review") or {}
+        check("e2e: mock review settles points and records the A/B race",
+              bool(_review_e2e.get("points"))
+              and (_review_e2e.get("ab") or {}).get("totals", {}).get("n") == 1
+              and Path("runs/dryrun/ab-ledger.json").exists())
+    finally:
+        _os.chdir(_cwd_e2e)
+
 print()
 if fails:
     print("FAILED:", ", ".join(fails))
