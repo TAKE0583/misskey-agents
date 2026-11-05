@@ -33,7 +33,9 @@ import json
 import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent / "vendor" / "keiba-scraping"))
 
@@ -50,6 +52,15 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
 JRA_RACE_URL = "https://race.netkeiba.com"
 NAR_RACE_URL = "https://nar.netkeiba.com"
+# Jockey/trainer profile pages live on db.netkeiba.com for both JRA
+# and NAR people (both shutuba pages link there).
+DB_URL = "https://db.netkeiba.com"
+
+# Person stats are cached per calendar day: the same jockeys and
+# trainers recur across the day's venues, and their profile pages
+# change at most daily. The cache file is runtime state, not a fixture
+# (it is listed in .gitignore).
+STATS_CACHE_PATH = Path(__file__).parent / "fixtures" / "person-stats-cache.json"
 
 # NAR trainer affiliations are place names (first two chars of the stable
 # string), outside the JRA validation set in keiba-scraping. Extending the
@@ -175,6 +186,229 @@ def fetch_win_odds(race_id: str, nar: bool = False) -> dict[int, float]:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Jockey / trainer performance data (db.netkeiba.com profile pages)
+#
+# Until 2026-11-05 the fixture carried people as bare names, so the AIs
+# could only judge famous JRA names from baked-in knowledge. The
+# profile pages publish per-jurisdiction season tables (年度別成績,
+# split 中央 / 地方) for NAR people too, so both modes fetch from the
+# same source. A per-venue breakdown exists only behind netkeiba's
+# premium mask (the data_summary tables show '**' for non-members),
+# so no venue split is attached. Identity comes from the shutuba
+# hrefs, never from name matching: the vendor entry parser's own ID
+# columns cannot be used because it slices the href assuming a
+# trailing slash, which NAR hrefs lack (its NAR 騎手ID comes out as
+# '/0559').
+# ---------------------------------------------------------------------------
+
+_PERSON_HREF_RE = {
+    "jockey": re.compile(r"/jockey/result/recent/([0-9A-Za-z]+)/?$"),
+    "trainer": re.compile(r"/trainer/result/recent/([0-9A-Za-z]+)/?$"),
+}
+# syusai (主催) query value on the profile page's 年度別 "more" links:
+# absent = 中央 (JRA), 20 = 地方 (NAR). The third box (海外) has no
+# such link and is not used.
+_SCOPE_BY_SYUSAI = {"": "中央", "20": "地方"}
+_SCOPES = ("中央", "地方")
+
+
+def parse_person_ids(soup: BeautifulSoup) -> dict[int, dict[str, str | None]]:
+    """Map horse number -> {jockey_id, trainer_id} from the shutuba
+    page's own links. Rows are keyed by their Umaban cell, so the
+    mapping cannot drift out of alignment with the entry table."""
+    out: dict[int, dict[str, str | None]] = {}
+    for row in soup.find_all("tr", class_="HorseList"):
+        num_td = row.find("td", class_=re.compile(r"Umaban"))
+        if num_td is None:
+            continue
+        try:
+            number = int(num_td.get_text(strip=True))
+        except ValueError:
+            continue
+        ids: dict[str, str | None] = {"jockey_id": None, "trainer_id": None}
+        for kind, td_class in (("jockey", "Jockey"), ("trainer", "Trainer")):
+            td = row.find("td", class_=td_class)
+            anchor = td.find("a") if td is not None else None
+            href = anchor.get("href") if anchor is not None else None
+            if href:
+                m = _PERSON_HREF_RE[kind].search(href)
+                if m:
+                    ids[f"{kind}_id"] = m.group(1)
+        out[number] = ids
+    return out
+
+
+def _stats_row(cells: list[str]) -> dict | None:
+    """One 年度別成績 body row -> counts, or None when the row is a
+    placeholder (empty / '-' cells). Columns are positional: the
+    layout (年度, 順位, 1着, 2着, 3着, 4着〜, 回数, ...) is shared by
+    the jockey （騎乗回数） and trainer （出走回数） tables."""
+    if len(cells) < 7:
+        return None
+    try:
+        wins = int(cells[2].replace(",", ""))
+        seconds = int(cells[3].replace(",", ""))
+        thirds = int(cells[4].replace(",", ""))
+        starts = int(cells[6].replace(",", ""))
+    except ValueError:
+        return None
+    if starts <= 0:
+        return None
+    return {"starts": starts, "wins": wins, "seconds": seconds, "thirds": thirds}
+
+
+def _with_rates(counts: dict, scope: str, year: int, career: bool) -> dict:
+    starts = counts["starts"]
+    w, s, t = counts["wins"], counts["seconds"], counts["thirds"]
+    return {
+        **counts,
+        "win_rate": round(100.0 * w / starts, 1),
+        "top2_rate": round(100.0 * (w + s) / starts, 1),
+        "top3_rate": round(100.0 * (w + s + t) / starts, 1),
+        "scope": scope,
+        "year": year,
+        "career": career,
+    }
+
+
+def _table_scope(table: BeautifulSoup) -> str | None:
+    """Jurisdiction of one ResultsByYears table, from the syusai
+    parameter of its ResultsBox 'more results' link."""
+    box = table.find_parent("div", class_="ResultsBox")
+    if box is None:
+        return None
+    for anchor in box.find_all("a", href=True):
+        href = anchor["href"]
+        if "result.html" not in href:
+            continue
+        syusai = (parse_qs(urlparse(href).query).get("syusai") or [""])[0]
+        return _SCOPE_BY_SYUSAI.get(syusai)
+    return None
+
+
+def parse_person_page(html: str, year: int) -> dict[str, dict | None]:
+    """Parse a db.netkeiba jockey/trainer profile page into
+    {scope: stats-or-None} for 中央 and 地方. The season row for
+    `year` wins; when a jurisdiction table has no row for the year,
+    its 累計 (career) row is used and flagged career=True. Rates are
+    computed from the counts (netkeiba's own percentages agree to
+    rounding), so a mangled rate header cell cannot corrupt them."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table", class_="ResultsByYears")
+    by_scope: dict[str, dict | None] = {scope: None for scope in _SCOPES}
+    for idx, table in enumerate(tables):
+        scope = _table_scope(table)
+        if scope is None and idx < len(_SCOPES):
+            scope = _SCOPES[idx]  # document order is 中央, 地方, 海外
+        if scope not in by_scope:
+            continue
+        season: dict | None = None
+        career: dict | None = None
+        for tr in table.find_all("tr"):
+            cells = [
+                c.get_text(strip=True).replace("\u3000", " ")
+                for c in tr.find_all(["th", "td"])
+            ]
+            if not cells:
+                continue
+            label = re.sub(r"\s+", "", cells[0])
+            counts = _stats_row(cells)
+            if counts is None:
+                continue
+            if label == str(year):
+                season = counts
+            elif label == "累計" and career is None:
+                career = counts
+        if season is not None:
+            by_scope[scope] = _with_rates(season, scope, year, career=False)
+        elif career is not None:
+            by_scope[scope] = _with_rates(career, scope, year, career=True)
+    return by_scope
+
+
+def _decode_db_html(content: bytes) -> str:
+    """db.netkeiba.com serves EUC-JP; fall back to UTF-8 if the
+    年度 marker is missing (page format change)."""
+    text = content.decode("euc-jp", errors="replace")
+    if "年度" not in text:
+        alt = content.decode("utf-8", errors="replace")
+        if "年度" in alt:
+            text = alt
+    return text
+
+
+def fetch_person_page_stats(
+    kind: str, person_id: str, year: int
+) -> dict[str, dict | None] | None:
+    """Fetch + parse one profile page. Best-effort like the odds
+    snapshot: any failure returns None and the caller degrades to
+    name-only rendering for that person."""
+    url = f"{DB_URL}/{kind}/{person_id}/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001 - stats are optional input
+        return None
+    time.sleep(0.3)  # keep the day's burst of profile fetches polite
+    return parse_person_page(_decode_db_html(resp.content), year)
+
+
+class PersonStatsCache:
+    """Day-valid cache of parsed profile pages, keyed by person.
+
+    One fetch per person per calendar day serves every race that day
+    (both jurisdictions are parsed from the single page). A failed or
+    empty fetch is cached too, so a db.netkeiba outage degrades the
+    whole day to name-only instead of being retried per race.
+    """
+
+    def __init__(self, path: Path, today: str | None = None, fetcher=None):
+        self.path = Path(path)
+        self.today = today or date.today().isoformat()
+        self.fetcher = fetcher or fetch_person_page_stats
+        self.dirty = False
+        self.data: dict = {}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data = loaded
+        except (OSError, ValueError):
+            self.data = {}
+
+    def get(
+        self, kind: str, person_id: str | None, scope: str, year: int
+    ) -> dict | None:
+        if not person_id:
+            return None
+        key = f"{kind}:{person_id}"
+        entry = self.data.get(key)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("fetched_on") != self.today
+            or entry.get("year") != year
+        ):
+            scopes = self.fetcher(kind, person_id, year)
+            entry = {
+                "fetched_on": self.today,
+                "year": year,
+                "scopes": scopes or {},
+            }
+            self.data[key] = entry
+            self.dirty = True
+        return (entry.get("scopes") or {}).get(scope)
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        self.dirty = False
+
+
 def nar_race_info(soup: BeautifulSoup, race_id: str, field_size: int) -> dict:
     """Extract the same info dict shape as EntryPageScraper.get_race_info
     from a nar.netkeiba.com shutuba page, whose markup differs from JRA's."""
@@ -227,7 +461,13 @@ def nar_race_info(soup: BeautifulSoup, race_id: str, field_size: int) -> dict:
     }
 
 
-def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> dict:
+def build_fixture(
+    race_id: str,
+    edition: int,
+    grade: str,
+    nar: bool = False,
+    stats_cache: PersonStatsCache | None = None,
+) -> dict:
     if nar:
         keiba_config.VALID_AFFILIATIONS.update(NAR_AFFILIATIONS)
         cfg = ScrapingConfig(netkeiba_race_url=NAR_RACE_URL)
@@ -240,6 +480,15 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
     else:
         info = scraper.get_race_info().to_dict("records")[0]
     form = fetch_recent_form(race_id, nar=nar)
+    # Jockey/trainer season stats from the db.netkeiba profile pages,
+    # keyed on the person IDs in the shutuba hrefs. Best-effort: a
+    # person whose stats cannot be fetched keeps null stats and the
+    # prompts render the name only, exactly as before this feature.
+    person_ids = parse_person_ids(scraper.soup)
+    stats_scope = "地方" if nar else "中央"
+    stats_year = int(str(info["日付"])[:4])
+    if stats_cache is None:
+        stats_cache = PersonStatsCache(STATS_CACHE_PATH)
     # Market snapshot: current win odds -> de-vigged win probabilities.
     # Legitimately empty before betting opens; the nulls then degrade
     # every downstream consumer to the pre-market behaviour.
@@ -271,6 +520,7 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
     horses = []
     for _, row in entry.sort_values("馬番").iterrows():
         number = int(row["馬番"])
+        ids = person_ids.get(number) or {}
         horses.append({
             "bracket": int(row["枠"]),
             "number": number,
@@ -279,6 +529,14 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
             "weight_kg": float(row["斤量"]),
             "jockey": row["騎手"],
             "trainer": row["厩舎"],
+            "jockey_id": ids.get("jockey_id"),
+            "trainer_id": ids.get("trainer_id"),
+            "jockey_stats": stats_cache.get(
+                "jockey", ids.get("jockey_id"), stats_scope, stats_year
+            ),
+            "trainer_stats": stats_cache.get(
+                "trainer", ids.get("trainer_id"), stats_scope, stats_year
+            ),
             "recent_form": form.get(number, []),
             "market": {
                 "odds": win_odds.get(number),
@@ -286,6 +544,7 @@ def build_fixture(race_id: str, edition: int, grade: str, nar: bool = False) -> 
                 "snapshot_time": snapshot_time,
             },
         })
+    stats_cache.save()
     return {"race": race, "horses": horses}
 
 
@@ -442,6 +701,14 @@ def main() -> int:
         print(f"market odds: snapshot for {with_odds} horses")
     else:
         print("market odds: not available yet (betting not open?)")
+    with_stats = sum(
+        1 for h in fixture["horses"]
+        if h.get("jockey_stats") or h.get("trainer_stats")
+    )
+    if with_stats:
+        print(f"person stats: season records attached for {with_stats} horses")
+    else:
+        print("person stats: not available (prompts render names only)")
     time.sleep(1)
     if args.results_out:
         results = build_results(args.race_id, fixture, nar=args.nar)

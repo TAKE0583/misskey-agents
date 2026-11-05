@@ -1072,6 +1072,235 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         _os.chdir(_cwd_e2e)
 
+# --- jockey / trainer performance data (2026-11-05) ----------------------
+# The fixture carries each person's season record (db.netkeiba profile
+# pages; the table for the race's own jurisdiction), keyed on the
+# person IDs in the shutuba hrefs and cached per calendar day. Prompts
+# render the record compactly on the runner line; a person without a
+# record renders name-only, exactly as before.
+
+if _bf is not None:
+    from bs4 import BeautifulSoup as _BS
+
+    _stats_head = (
+        "<tr><th>年度</th><th>順位</th><th>1着</th><th>2着</th><th>3着</th>"
+        "<th>4着〜</th><th>騎乗 回数</th><th>重賞 出走</th><th>重賞 勝利</th>"
+        "<th>勝率</th><th>連対率</th><th>複勝率</th><th>代表馬</th></tr>"
+    )
+
+    def _stats_box(rows: str, more: str) -> str:
+        return (
+            '<div class="ResultsBox"><div class="mode_detail">'
+            '<table class="ResultsByYears nk_tb_common race_table_01">'
+            + _stats_head + rows + "</table>"
+            + f'<a href="{more}">もっと見る</a></div></div>'
+        )
+
+    _page_html = (
+        _stats_box(
+            "<tr><td>累計</td><td></td><td>100</td><td>80</td><td>70</td>"
+            "<td>750</td><td>1000</td><td>10</td><td>1</td>"
+            "<td>10.0％</td><td>18.0％</td><td>25.0％</td><td></td></tr>"
+            "<tr><td>2026</td><td>5</td><td>10</td><td>5</td><td>5</td>"
+            "<td>30</td><td>50</td><td>2</td><td>0</td>"
+            "<td>20.0％</td><td>30.0％</td><td>40.0％</td><td>テスト</td></tr>",
+            "https://db.netkeiba.com/jockey/result.html?id=00000",
+        )
+        + _stats_box(
+            "<tr><td>累計</td><td></td><td>50</td><td>30</td><td>20</td>"
+            "<td>400</td><td>500</td><td>0</td><td>0</td>"
+            "<td>10.0％</td><td>16.0％</td><td>20.0％</td><td></td></tr>"
+            "<tr><td>2026</td><td>35</td><td>8</td><td>4</td><td>8</td>"
+            "<td>60</td><td>80</td><td>0</td><td>0</td>"
+            "<td>10.0％</td><td>15.0％</td><td>25.0％</td><td>テスト</td></tr>",
+            "https://db.netkeiba.com/jockey/result.html?id=00000&syusai=20",
+        )
+    )
+    _scopes = _bf.parse_person_page(_page_html, 2026)
+    check("person stats: 中央 season row parsed, rates computed from counts",
+          _scopes["中央"]["starts"] == 50 and _scopes["中央"]["wins"] == 10
+          and _scopes["中央"]["win_rate"] == 20.0
+          and _scopes["中央"]["top2_rate"] == 30.0
+          and _scopes["中央"]["top3_rate"] == 40.0
+          and _scopes["中央"]["career"] is False)
+    check("person stats: 地方 season row parsed from the syusai=20 table",
+          _scopes["地方"]["starts"] == 80 and _scopes["地方"]["wins"] == 8
+          and _scopes["地方"]["win_rate"] == 10.0
+          and _scopes["地方"]["top2_rate"] == 15.0
+          and _scopes["地方"]["top3_rate"] == 25.0)
+    _career_html = _stats_box(
+        "<tr><td>累計</td><td></td><td>50</td><td>30</td><td>20</td>"
+        "<td>400</td><td>500</td><td>0</td><td>0</td>"
+        "<td>10.0％</td><td>16.0％</td><td>20.0％</td><td></td></tr>",
+        "https://db.netkeiba.com/trainer/result.html?id=00000&syusai=20",
+    )
+    _career_scopes = _bf.parse_person_page(_career_html, 2026)
+    check("person stats: no season row falls back to the career row, flagged",
+          _career_scopes["地方"]["career"] is True
+          and _career_scopes["地方"]["starts"] == 500
+          and _career_scopes["地方"]["top3_rate"] == 20.0
+          and _career_scopes["中央"] is None)
+    check("person stats: a page without stats tables yields no stats",
+          _bf.parse_person_page("<html><body>x</body></html>", 2026)
+          == {"中央": None, "地方": None})
+
+    _shutuba_html = (
+        "<table>"
+        '<tr class="HorseList"><td class="Umaban1">1</td>'
+        '<td class="Jockey"><a href="https://db.netkeiba.com/jockey/result/recent/05592">騎手甲</a></td>'
+        '<td class="Trainer"><a href="https://db.netkeiba.com/trainer/result/recent/05660/">調教師甲</a></td></tr>'
+        '<tr class="HorseList"><td class="Umaban2">2</td>'
+        '<td class="Jockey"><span class="Jockey"><a href="https://db.netkeiba.com/jockey/result/recent/a03d6">騎手乙</a></span></td>'
+        '<td class="Trainer"><a href="https://db.netkeiba.com/trainer/result/recent/05706">調教師乙</a></td></tr>'
+        "</table>"
+    )
+    _ids = _bf.parse_person_ids(_BS(_shutuba_html, "html.parser"))
+    check("person ids: shutuba hrefs keyed by horse number, slash or not",
+          _ids[1] == {"jockey_id": "05592", "trainer_id": "05660"}
+          and _ids[2] == {"jockey_id": "a03d6", "trainer_id": "05706"})
+
+    _FAKE_J = {"starts": 80, "wins": 8, "seconds": 4, "thirds": 8,
+               "win_rate": 10.0, "top2_rate": 15.0, "top3_rate": 25.0,
+               "scope": "地方", "year": 2026, "career": False}
+    _FAKE_C = dict(_FAKE_J, scope="中央")
+
+    with tempfile.TemporaryDirectory() as td:
+        _calls: list = []
+
+        def _counting_fetcher(kind, pid, year):
+            _calls.append((kind, pid))
+            if pid == "bad01":
+                return None
+            return {"中央": _FAKE_C, "地方": _FAKE_J}
+
+        _cache = _bf.PersonStatsCache(
+            Path(td) / "c.json", today="2026-11-05", fetcher=_counting_fetcher
+        )
+        _s1 = _cache.get("jockey", "05592", "地方", 2026)
+        _s2 = _cache.get("jockey", "05592", "地方", 2026)
+        check("person cache: same person fetched once per day",
+              _calls.count(("jockey", "05592")) == 1
+              and _s1 == _s2 and _s1["wins"] == 8)
+        check("person cache: both jurisdictions come from the one fetch",
+              _cache.get("jockey", "05592", "中央", 2026) == _FAKE_C
+              and _calls.count(("jockey", "05592")) == 1)
+        check("person cache: a failed fetch degrades to None, not retried",
+              _cache.get("jockey", "bad01", "地方", 2026) is None
+              and _cache.get("jockey", "bad01", "地方", 2026) is None
+              and _calls.count(("jockey", "bad01")) == 1)
+        _cache.save()
+        _cache2 = _bf.PersonStatsCache(
+            Path(td) / "c.json", today="2026-11-05", fetcher=_counting_fetcher
+        )
+        check("person cache: a new instance the same day reuses the file",
+              _cache2.get("jockey", "05592", "地方", 2026) == _FAKE_J
+              and _calls.count(("jockey", "05592")) == 1)
+        _cache3 = _bf.PersonStatsCache(
+            Path(td) / "c.json", today="2026-11-06", fetcher=_counting_fetcher
+        )
+        _cache3.get("jockey", "05592", "地方", 2026)
+        check("person cache: a new calendar day refetches",
+              _calls.count(("jockey", "05592")) == 2)
+
+    # Fixture build over a fully mocked network: stats are attached by
+    # person ID, the shared trainer is fetched once across two builds,
+    # and the jockey whose fetch fails degrades to null stats.
+    import datetime as _dt
+    import pandas as _pd
+
+    _build_shutuba = (
+        "<table>"
+        '<tr class="HorseList"><td class="Umaban1">1</td>'
+        '<td class="Jockey"><a href="https://db.netkeiba.com/jockey/result/recent/05592">騎手甲</a></td>'
+        '<td class="Trainer"><a href="https://db.netkeiba.com/trainer/result/recent/05660/">調教師甲</a></td></tr>'
+        '<tr class="HorseList"><td class="Umaban1">2</td>'
+        '<td class="Jockey"><a href="https://db.netkeiba.com/jockey/result/recent/bad01">騎手乙</a></td>'
+        '<td class="Trainer"><a href="https://db.netkeiba.com/trainer/result/recent/05660/">調教師甲</a></td></tr>'
+        "</table>"
+    )
+
+    class _FakeEntryScraper:
+        def __init__(self, race_id, cfg):
+            self.soup = _BS(_build_shutuba, "html.parser")
+
+        def get_entry(self):
+            return _pd.DataFrame([
+                {"枠": 1, "馬番": 1, "馬名": "テストイチ", "性別": "牡",
+                 "年齢": 3, "斤量": 56.0, "騎手": "騎手甲", "厩舎": "調教師甲"},
+                {"枠": 1, "馬番": 2, "馬名": "テストニ", "性別": "牝",
+                 "年齢": 4, "斤量": 54.0, "騎手": "騎手乙", "厩舎": "調教師甲"},
+            ])
+
+        def get_race_info(self):
+            return _pd.DataFrame([{
+                "レース名": "テスト記念", "日付": _dt.date(2026, 11, 5),
+                "競馬場": "東京", "発走時刻": "15:40", "芝ダ": "芝",
+                "左右": "左", "内外": "", "距離": 2000, "天候": "晴",
+                "馬場": "良", "競走条件": "3歳以上", "頭数": 2,
+            }])
+
+    with tempfile.TemporaryDirectory() as td:
+        _bcalls: list = []
+
+        def _build_fetcher(kind, pid, year):
+            _bcalls.append((kind, pid))
+            if pid == "bad01":
+                return None
+            return {"中央": _FAKE_C, "地方": _FAKE_J}
+
+        _bcache = _bf.PersonStatsCache(
+            Path(td) / "b.json", today="2026-11-05", fetcher=_build_fetcher
+        )
+        _orig_scraper = _bf.EntryPageScraper
+        _orig_form = _bf.fetch_recent_form
+        _orig_odds = _bf.fetch_win_odds
+        _bf.EntryPageScraper = _FakeEntryScraper
+        _bf.fetch_recent_form = lambda race_id, nar=False: {}
+        _bf.fetch_win_odds = lambda race_id, nar=False: {}
+        try:
+            _fx1 = _bf.build_fixture(
+                "202605041199", 1, "OP", nar=False, stats_cache=_bcache
+            )
+            _fx2 = _bf.build_fixture(
+                "202605041199", 1, "OP", nar=False, stats_cache=_bcache
+            )
+        finally:
+            _bf.EntryPageScraper = _orig_scraper
+            _bf.fetch_recent_form = _orig_form
+            _bf.fetch_win_odds = _orig_odds
+        _h1, _h2 = _fx1["horses"]
+        check("person build: stats attached by ID, failure degrades to null",
+              _h1["jockey_id"] == "05592" and _h1["jockey_stats"] == _FAKE_C
+              and _h1["trainer_stats"] == _FAKE_C
+              and _h2["jockey_stats"] is None
+              and _h2["trainer_stats"] == _FAKE_C
+              and len(_fx2["horses"]) == 2)
+        check("person build: overlapping people fetched once across fixtures",
+              _bcalls.count(("jockey", "05592")) == 1
+              and _bcalls.count(("trainer", "05660")) == 1
+              and _bcalls.count(("jockey", "bad01")) == 1)
+else:
+    print("SKIP person-stats checks (build_fixture needs the venv python)")
+
+_stats_fx = _copy.deepcopy(monbetsu)
+_stats_fx["horses"][0]["jockey_stats"] = {
+    "starts": 786, "wins": 101, "seconds": 71, "thirds": 95,
+    "win_rate": 12.8, "top2_rate": 21.9, "top3_rate": 34.0,
+    "scope": "地方", "year": 2026, "career": False,
+}
+_stats_fx["horses"][0]["trainer_stats"] = {
+    "starts": 1783, "wins": 98, "seconds": 133, "thirds": 157,
+    "win_rate": 5.5, "top2_rate": 13.0, "top3_rate": 21.8,
+    "scope": "地方", "year": 2026, "career": True,
+}
+check("person stats: race text renders the compact stats segment",
+      "騎手（地方・今季）勝率12.8% 連対21.9% 複勝34.0%" in o.race_text(_stats_fx)
+      and "調教師（地方・通算）勝率5.5% 連対13.0% 複勝21.8%"
+      in o.race_text(_stats_fx))
+check("person stats: missing stats keep the name-only runner line",
+      o.person_stats_text(monbetsu["horses"][0]) == ""
+      and "騎手（" not in o.race_text(monbetsu))
+
 print()
 if fails:
     print("FAILED:", ", ".join(fails))

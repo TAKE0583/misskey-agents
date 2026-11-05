@@ -171,11 +171,35 @@ SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、�
 △ 馬番 馬名 勝率○% 3着内○% — 理由
 勝率と3着内率はあなたの推定です。勝率は1〜90%、3着内率は勝率以上99%以下にし、4頭の勝率の合計は100%を超えないでください。人気だけに引きずられず、「勝つ確率が高いのに評価が割れそうな馬」を見抜くことが持ち点を増やす近道です。
 出走馬データに「市場勝率○%」と併記されている数値は、単勝オッズから算出した市場の勝率評価です（併記がないレースでは市場データなし）。あなたの勝率は市場との差（乖離）として捉え、各印の理由では「市場が何を見落としているのか」を、その差の大きさ（ポイント）とともに具体的に述べてください。市場との乖離が大きいほど強い根拠が必要です。根拠が弱い場合は、無理に乖離を作らず市場寄りの評価にしてください。
+出走馬データに「騎手（中央・今季）勝率○% 連対○% 複勝○%」のように併記されている数値は、その騎手・調教師の当該主催（中央/地方）における今季成績です（「通算」とある場合は今季の記録がないための通算成績）。併記がない人物は成績データなしです。騎手の評価は名前の印象ではなく、この数字を根拠にしてください。
 印のあとに、あなた自身が馬券を買うならどう買うかも、必ず次の形式で書いてください（券種・組み合わせ・金額を1行に1点。金額は持ち点から賭ける点数で、上限は別途指示されます）:
 【買い目】
 単勝 7 500
 3連複 1-7-11 500
 全体で800字程度に収めてください。"""
+
+
+def person_stats_text(horse: dict) -> str:
+    """Compact jockey/trainer season record for one runner line, e.g.
+    '騎手（地方・今季）勝率12.8% 連対21.9% 複勝34.0% / 調教師（地方・今季）…'.
+    The stats come from the fixture's jockey_stats / trainer_stats
+    (db.netkeiba season tables for the race's own jurisdiction;
+    career=True renders 通算 instead of 今季）. A person without
+    stats contributes nothing, and a runner with neither renders the
+    empty string, leaving the line exactly as it was before the
+    fixture carried stats."""
+    parts = []
+    for key, label in (("jockey_stats", "騎手"), ("trainer_stats", "調教師")):
+        st = horse.get(key)
+        if not st:
+            continue
+        span = "通算" if st.get("career") else "今季"
+        parts.append(
+            f"{label}（{st['scope']}・{span}）"
+            f"勝率{st['win_rate']:.1f}% 連対{st['top2_rate']:.1f}% "
+            f"複勝{st['top3_rate']:.1f}%"
+        )
+    return " / ".join(parts)
 
 
 def race_text(fixture: dict, form_limit: int | None = None) -> str:
@@ -195,6 +219,9 @@ def race_text(fixture: dict, form_limit: int | None = None) -> str:
         mkt = h.get("market") or {}
         if mkt.get("win_prob") is not None:
             line += f" / 市場勝率{mkt['win_prob'] * 100:.1f}%（単勝{mkt.get('odds')}倍）"
+        stats = person_stats_text(h)
+        if stats:
+            line += f" / {stats}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -217,7 +244,7 @@ BET_SECTION_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?(.*)", re.S)
 
 LOCAL_SYSTEM = """あなたは ローカルLLM（Qwen3） です。競馬予想AIとして、他のAIと議論して最終的に一つの結論に収束させる場に参加しています。
 予想は特定の観点に偏らず、過去の走破内容・騎手・枠順・馬場状態・脚質と想定ペース・近走の勢いを総合的に判断してください。
-出力は指定されたJSON形式のみです。出走データに「市場勝率○%」とある数値は単勝オッズ由来の市場の勝率評価です。各印の理由では、自分の勝率と市場勝率との差（乖離、ポイント）と、その根拠（市場が見落としている情報）を短く述べてください。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は持ち点から賭ける点数で、合計は指示された上限以内にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
+出力は指定されたJSON形式のみです。出走データに「市場勝率○%」とある数値は単勝オッズ由来の市場の勝率評価です。各印の理由では、自分の勝率と市場勝率との差（乖離、ポイント）と、その根拠（市場が見落としている情報）を短く述べてください。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は持ち点から賭ける点数で、合計は指示された上限以内にしてください。出走データに「騎手（中央・今季）勝率○% 連対○% 複勝○%」とある数値は、その騎手・調教師の当該主催（中央/地方）での今季成績です（「通算」は今季の記録がない場合の通算成績）。併記がない人物は成績データなしです。騎手の評価は名前の印象ではなく、この数字を根拠にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
 出力例: {"marks": [{"mark": "◎", "number": 7, "win_pct": 30, "top3_pct": 60, "reason": "近走の内容が安定"}, {"mark": "○", "number": 1, "win_pct": 22, "top3_pct": 50, "reason": "コース適性が高い"}, {"mark": "▲", "number": 11, "win_pct": 15, "top3_pct": 40, "reason": "脚質が展開に合う"}, {"mark": "△", "number": 4, "win_pct": 10, "top3_pct": 30, "reason": "人気薄だが一発がある"}], "bets": [{"type": "単勝", "combo": "7", "amount": 500}, {"type": "3連複", "combo": "1-7-11", "amount": 500}], "comment": "全体のまとめを1〜2文で。"}"""
 
 PREDICTION_SCHEMA = {
