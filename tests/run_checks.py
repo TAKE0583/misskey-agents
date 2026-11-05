@@ -279,9 +279,11 @@ class _CountingMock(providers.MockProvider):
     def __init__(self, display):
         super().__init__(display)
         self.calls = 0
+        self.users = []
 
     def chat(self, system, user, model=None, max_tokens=None):
         self.calls += 1
+        self.users.append(user)
         return super().chat(system, user, model=model, max_tokens=max_tokens)
 
 
@@ -311,8 +313,13 @@ except RuntimeError:
 a_calls_after_fail = prov_a.calls
 cache = json.loads(json.dumps(cache))  # simulate the state save/load cycle
 o._generate_prediction_texts(monbetsu, built2, cache=cache)
+# Since 2026-11-05 the mock's rotated debate ballot can contradict its
+# prediction bets, which legitimately costs A bets-regeneration calls;
+# the invariant this check guards is narrower: A's PREDICTION prompt
+# was sent exactly once across both runs (the cached text was reused).
 check("gen cache: provider A not re-billed for its cached prediction",
-      prov_a.calls == a_calls_after_fail + 1)  # +1 is A's debate only
+      sum(1 for u in prov_a.users if "次のレースの予想をしてください" in u) == 1
+      and prov_a.calls > a_calls_after_fail)  # debate (+maybe regen) did run
 
 # #6: flock-based race lock excludes a second holder, then frees
 _cwd = _os.getcwd()
@@ -462,6 +469,204 @@ check("gen points: opening and conclusion carry balances and fair odds",
       "持ち点" in _gen_pts["texts"]["opening"]
       and "フェアオッズ" in _gen_pts["texts"]["conclusion"]
       and "結論口座" in _gen_pts["texts"]["conclusion"])
+
+# --- Exclusion + bet reconciliation (2026-11-05 user decisions) ---------
+# (1) An AI that fails validation twice is excluded and the rest of the
+# field completes the race; (2) bets that contradict the final marks
+# are regenerated (or rebuilt deterministically) so settlement always
+# uses slips consistent with the final ballot.
+
+check("consistency: bets within final marks pass",
+      o.bet_consistency_errors(good_bets, good, monbetsu) == [])
+_marks_flip = {"◎": (2, "ラップドアップ"), "○": (10, "タイムエッジ"),
+               "▲": (4, "ダムドローズ"), "△": (1, "エリオラ")}
+check("consistency: no bet on the final honmei flagged",
+      o.bet_consistency_errors(good_bets, _marks_flip, monbetsu) != [])
+check("consistency: leg outside the final marks flagged",
+      o.bet_consistency_errors(
+          [{"type": "単勝", "numbers": [3], "amount": 1000}], good, monbetsu) != [])
+_b_of = {h["number"]: h["bracket"] for h in monbetsu["horses"]}
+check("consistency: wakuren over marked brackets passes",
+      o.bet_consistency_errors(
+          [{"type": "枠連", "numbers": [_b_of[10], _b_of[4]], "amount": 1000}],
+          good, monbetsu) == [])
+_unmarked_bracket = next(
+    b for b in set(_b_of.values())
+    if all(_b_of[n] != b for n in (10, 4, 1, 2))
+)
+check("consistency: wakuren on a bracket with no marked horse flagged",
+      o.bet_consistency_errors(
+          [{"type": "枠連", "numbers": [_unmarked_bracket, _b_of[10]], "amount": 1000}],
+          good, monbetsu) != [])
+
+
+class _AlwaysInvalid:
+    """Provider whose every reply fails validation (no marks, no bets)."""
+    name = "bad"
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        return "よく分かりませんが、適当にこの馬が来ると思います。"
+
+
+_bad_persona = {"username": "badai", "display": "バッドAI"}
+
+# (a) one AI invalid twice -> excluded, remaining three complete
+_built_a = [(p, providers.MockProvider(p["display"])) for p in o.PERSONAS]
+_built_a.append((_bad_persona, _AlwaysInvalid()))
+_gen_a = o._generate_prediction_texts(monbetsu, _built_a)
+check("exclusion: race completes with the remaining AIs",
+      bool(_gen_a["texts"]["conclusion"])
+      and len(_gen_a["texts"]["predictions"]) == 3)
+check("exclusion: recorded in state with stage and reason",
+      len(_gen_a["excluded"]) == 1
+      and _gen_a["excluded"][0]["username"] == "badai"
+      and _gen_a["excluded"][0]["stage"] == "prediction"
+      and bool(_gen_a["excluded"][0]["reason"]))
+check("exclusion: excluded AI has no prediction, marks, or bets",
+      "badai" not in _gen_a["texts"]["predictions"]
+      and "badai" not in _gen_a["final_marks"]
+      and "badai" not in _gen_a["final_bets"])
+check("exclusion: conclusion and review name the absent AI",
+      "バッドAI" in _gen_a["texts"]["conclusion"]
+      and "badai" in o.build_review_text(monbetsu, monbetsu_results, _gen_a))
+with tempfile.TemporaryDirectory() as td:
+    _led_a = points_mod.PointsLedger(Path(td) / "points.json")
+    _recs_a = o.settle_race_points(monbetsu, synth_results, _gen_a, _led_a)
+    check("exclusion: settlement skips the excluded AI",
+          "badai" not in _recs_a
+          and set(_recs_a) == {"chatgpt", "claude", "gemini", "shikai"})
+
+# (c) exclusions that leave fewer than two AIs abort the run
+try:
+    o._generate_prediction_texts(
+        monbetsu,
+        [(o.PERSONAS[0], providers.MockProvider("x")),
+         (_bad_persona, _AlwaysInvalid())],
+    )
+    check("exclusion: dropping to one active AI aborts", False)
+except RuntimeError:
+    check("exclusion: dropping to one active AI aborts", True)
+try:
+    o._generate_prediction_texts(
+        monbetsu,
+        [(o.PERSONAS[0], providers.MockProvider("x")),
+         (_bad_persona, _AlwaysInvalid()),
+         ({"username": "badai2", "display": "バッドAI2"}, _AlwaysInvalid())],
+    )
+    check("exclusion: two failures out of three abort", False)
+except RuntimeError:
+    check("exclusion: two failures out of three abort", True)
+
+
+# (b) debate flips the honmei -> bets are regenerated onto the final marks
+class _FlipStub:
+    """Cloud stub: valid prediction on ◎10, debate ballot flips ◎ to 2,
+    and the bets-only regeneration answers with slips on the new ◎."""
+    name = "flip"
+
+    def __init__(self, regen_text):
+        self.regen_text = regen_text
+        self.regen_calls = 0
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        if "買い目だけを出し直して" in user:
+            self.regen_calls += 1
+            return self.regen_text
+        if "議論" in user or "他のAI" in user:
+            return (
+                "議論の結果、本命を入れ替えます。\n\n【最終票】\n"
+                "◎ 2 ラップドアップ\n○ 10 タイムエッジ\n"
+                "▲ 4 ダムドローズ\n△ 1 エリオラ"
+            )
+        return text_ok
+
+
+_flip_persona = {"username": "flip", "display": "フリップ"}
+_stub_b = _FlipStub("【買い目】\n単勝 2 400点\n3連複 2-4-10 600点")
+_gen_b = o._generate_prediction_texts(monbetsu, [(_flip_persona, _stub_b)])
+check("reconcile: flipped honmei triggers a bets revision",
+      _gen_b["final_marks"]["flip"]["◎"][0] == 2
+      and _stub_b.regen_calls == 1
+      and _gen_b["bet_revisions"]["flip"]["method"] == "regenerated"
+      and _gen_b["bet_revisions"]["flip"]["original_bets"][0]["numbers"] == [10])
+check("reconcile: regenerated bets are consistent with the final marks",
+      _gen_b["final_bets"]["flip"] == [
+          {"type": "単勝", "numbers": [2], "amount": 400},
+          {"type": "3連複", "numbers": [2, 4, 10], "amount": 600},
+      ]
+      and o.bet_consistency_errors(
+          _gen_b["final_bets"]["flip"],
+          {mk: tuple(v) for mk, v in _gen_b["final_marks"]["flip"].items()},
+          monbetsu) == []
+      and "単勝 2" in _gen_b["bets"]["flip"]
+      and "単勝 2" in _gen_b["texts"]["conclusion"])
+
+# (b2) regeneration also fails -> deterministic rebuild from final marks
+_stub_b2 = _FlipStub("【買い目】\n単勝 99 1000点")
+_gen_b2 = o._generate_prediction_texts(monbetsu, [(_flip_persona, _stub_b2)])
+check("reconcile: failed regeneration falls back to a deterministic rebuild",
+      _gen_b2["bet_revisions"]["flip"]["method"] == "deterministic-fallback"
+      and _gen_b2["final_bets"]["flip"] == [
+          {"type": "単勝", "numbers": [2], "amount": 500},
+          {"type": "3連複", "numbers": [2, 4, 10], "amount": 500},
+      ]
+      and o.bet_consistency_errors(
+          _gen_b2["final_bets"]["flip"],
+          {mk: tuple(v) for mk, v in _gen_b2["final_marks"]["flip"].items()},
+          monbetsu) == [])
+
+
+# (b3) the structured (local) persona goes through the same route
+class _LocalFlipStub:
+    name = "localstub"
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        return "議論します。本命を入れ替えるべきだと考えます。"
+
+    def chat_json(self, system, user, schema, model=None, max_tokens=None):
+        props = schema.get("properties") or {}
+        if "marks" in props and "bets" in props:  # prediction schema
+            return {"marks": [
+                        {"mark": "◎", "number": 10, "win_pct": 30, "top3_pct": 60, "reason": "本命"},
+                        {"mark": "○", "number": 4, "win_pct": 22, "top3_pct": 50, "reason": "対抗"},
+                        {"mark": "▲", "number": 1, "win_pct": 15, "top3_pct": 40, "reason": "単穴"},
+                        {"mark": "△", "number": 2, "win_pct": 10, "top3_pct": 30, "reason": "連下"}],
+                    "bets": [{"type": "単勝", "combo": "10", "amount": 1000}],
+                    "comment": ""}
+        if "marks" in props:  # ballot schema: honmei flips to 2
+            return {"marks": [
+                        {"mark": "◎", "number": 2, "reason": "討論で変更"},
+                        {"mark": "○", "number": 10, "reason": "対抗"},
+                        {"mark": "▲", "number": 4, "reason": "単穴"},
+                        {"mark": "△", "number": 1, "reason": "連下"}],
+                    "comment": ""}
+        return {"bets": [{"type": "単勝", "combo": "2", "amount": 1000}]}
+
+
+_local_flip_persona = {"username": "local", "display": "ローカル", "structured": True}
+_gen_b3 = o._generate_prediction_texts(
+    monbetsu, [(_local_flip_persona, _LocalFlipStub())]
+)
+check("reconcile: structured persona's bets are regenerated the same way",
+      _gen_b3["final_marks"]["local"]["◎"][0] == 2
+      and _gen_b3["final_bets"]["local"] == [
+          {"type": "単勝", "numbers": [2], "amount": 1000}]
+      and _gen_b3["bet_revisions"]["local"]["method"] == "regenerated")
+
+# settlement prefers the reconciled final_bets over the prediction text
+with tempfile.TemporaryDirectory() as td:
+    _led_fb = points_mod.PointsLedger(Path(td) / "points.json")
+    _state_fb = {
+        "race": "第1回 2歳 未勝利",
+        "race_id": monbetsu["race"]["race_id"],
+        "texts": {"predictions": {"chatgpt": text_ok}},
+        "final_bets": {"chatgpt": [{"type": "単勝", "numbers": [2], "amount": 1000}]},
+        "final_bet": None,
+    }
+    _recs_fb = o.settle_race_points(monbetsu, synth_results, _state_fb, _led_fb)
+    check("settle race: reconciled final_bets win over prediction text",
+          _recs_fb["chatgpt"]["staked"] == 1000
+          and _recs_fb["chatgpt"]["returned"] == 2900)
 
 print()
 if fails:

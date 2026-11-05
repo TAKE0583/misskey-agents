@@ -870,12 +870,379 @@ def _points_view(points: dict | None, built, display_of: dict) -> str:
     return " / ".join(parts)
 
 
+class _StageFailure(RuntimeError):
+    """A generation-stage failure carrying the stage name, so the caller
+    can record WHERE an excluded AI fell out (prediction/debate/ballot)."""
+
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
+
+def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
+                              balance: int | None, cap: int | None) -> str:
+    """One cloud persona's free-text prediction, fully validated, with
+    the standard one error-feedback retry. Raises RuntimeError when the
+    retry still fails validation."""
+    username = persona["username"]
+    system = SYSTEM_TEMPLATE.format(display=persona["display"])
+    user = f"次のレースの予想をしてください。\n\n{body}"
+    user += budget_line(balance, cap)
+    text = prov.chat(system, user)
+    errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
+    if errors:
+        print(f"[prediction retry for {username}: {errors}]", file=sys.stderr)
+        retry = prov.chat(
+            system,
+            user
+            + "\n\n【重要】前回の出力に次の問題がありました: "
+            + " / ".join(errors)
+            + "\nすべて直して、印4つ（◎○▲△、すべて異なる実在の馬、各印に勝率と3着内率）と"
+            "【買い目】（券種ごとの頭数を守り、金額は100単位・上限以内）"
+            "を含む完全な予想を出し直してください。",
+        )
+        errors = prediction_errors(retry, fixture, max_total=cap) if retry.strip() else ["再生成の出力が空でした"]
+        if errors:
+            raise RuntimeError(
+                f"prediction from {username} failed validation after retry: {errors}"
+            )
+        text = retry
+    return text
+
+
+def _generate_debate_and_ballot(prov, persona: dict, fixture: dict, body: str,
+                                predictions: dict, roster: list) -> tuple[str, dict]:
+    """One persona's debate reply plus its validated final ballot, as
+    (debate text, {mark: (number, name)}). Raises _StageFailure with the
+    failing stage on irrecoverable problems, RuntimeError otherwise."""
+    username = persona["username"]
+    others = "\n\n".join(
+        f"--- {p['display']} の予想 ---\n{predictions[p['username']]}"
+        for p, _ in roster
+        if p["username"] != username and p["username"] in predictions
+    )
+    # The local model generates slowly and its context is precious:
+    # for the structured persona, trim the debate prompt (shorter
+    # form lines, other predictions excerpted) and cap the reply
+    # budget. Cloud personas keep the full context. (The untrimmed
+    # prompt plus a 4096-token context made the local debate call
+    # hit its 600s timeout in the 2026-11-05 Monbetsu 12R dry run.)
+    prompt_body, prompt_others, chat_budget = body, others, None
+    if persona.get("structured"):
+        prompt_body = race_text(fixture, form_limit=3)
+        prompt_others = "\n\n".join(
+            f"--- {p['display']} の予想 ---\n{predictions[p['username']][:500]}"
+            for p, _ in roster
+            if p["username"] != username and p["username"] in predictions
+        )
+        chat_budget = 2500
+    system = SYSTEM_TEMPLATE.format(display=persona["display"])
+    user = (
+        "他のAIの予想が出そろいました。元の出走データと各AIの予想を踏まえて、"
+        "議論として応答してください。最も同意できる点と最も異論のある点を"
+        "具体的に挙げてください。\n"
+        "最後に、議論を踏まえたあなたの最終票を必ず次の形式で書いてください"
+        "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にしてください）:\n"
+        "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
+        f"【元の出走データ】\n{prompt_body}\n\n"
+        f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{prompt_others}"
+    )
+    try:
+        text = prov.chat(system, user, max_tokens=chat_budget)
+    except Exception as exc:  # noqa: BLE001 - re-raised with stage info
+        raise _StageFailure("debate", f"debate generation failed: {exc}") from exc
+    if not text.strip():
+        raise _StageFailure("debate", f"empty debate reply from {username}")
+    if persona.get("structured") and hasattr(prov, "chat_json"):
+        context = (
+            "次のレースについて、他のAIとの議論を踏まえた最終票をJSONで出してください。\n\n"
+            f"【元の出走データ】\n{race_text(fixture, form_limit=3)}\n\n"
+            f"【自分の予想】\n{predictions[username]}\n\n"
+            f"【他のAIの予想（抜粋）】\n{prompt_others}\n\n【自分の議論】\n{text[:800]}"
+        )
+        try:
+            ballot = generate_structured_ballot(prov, fixture, context)
+        except Exception as exc:  # noqa: BLE001 - re-raised with stage info
+            raise _StageFailure("ballot", f"structured ballot failed: {exc}") from exc
+        # Publish the validated structured ballot, not whatever the
+        # free-form debate prose happened to claim (finding 1).
+        return splice_ballot(text, ballot), ballot
+    marks, errors = _ballot_errors(text, fixture)
+    if errors:
+        print(f"[ballot retry for {username}: {errors}]", file=sys.stderr)
+        try:
+            retry = prov.chat(
+                system,
+                "最終票だけを出し直してください。前回の問題: "
+                + " / ".join(errors)
+                + "\n次の形式のみで出力してください:\n"
+                "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
+                f"【元の出走データ】\n{body}",
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised with stage info
+            raise _StageFailure("ballot", f"ballot retry failed: {exc}") from exc
+        marks, errors = _ballot_errors(retry, fixture)
+        if errors:
+            raise _StageFailure(
+                "ballot",
+                f"final ballot from {username} failed validation after retry: {errors}",
+            )
+        head = text.rfind("【最終票】")
+        base = text[:head].rstrip() if head >= 0 else text.rstrip()
+        text = base + "\n\n" + retry.strip()
+    names = {h["number"]: h["name"] for h in fixture["horses"]}
+    return text, {
+        mk: (num, names.get(num, name)) for mk, (num, name) in marks.items()
+    }
+
+
+# --- Bet/final-mark reconciliation (2026-11-05) ----------------------------
+# Bets are fixed at prediction time, but the debate can move an AI's
+# marks afterwards — the Funabashi 11R case: @local's final ◎ flipped
+# 14 -> 5 in the debate while every one of its bets still rode the
+# initial ◎14, a horse its final ballot no longer marked at all. After
+# the final ballots are known, each AI's bets are checked against its
+# FINAL marks; a contradiction triggers a bets-only regeneration, and
+# if that also fails the bets are rebuilt deterministically from the
+# final marks (the same builder as the moderator's final bet). The
+# race never aborts over a stale bet slip, and settlement always uses
+# the reconciled bets.
+
+BETS_REGEN_SCHEMA = {
+    "type": "object",
+    "properties": {"bets": PREDICTION_SCHEMA["properties"]["bets"]},
+    "required": ["bets"],
+}
+
+
+def bet_consistency_errors(bets: list[dict], final_marks: dict,
+                           fixture: dict) -> list[str]:
+    """Bets contradict the final marks when a leg names a horse outside
+    the final four marks, or when no bet covers the final ◎ at all.
+    枠連 legs are bracket numbers, so a bracket leg contradicts only
+    when its bracket contains no marked horse, and it covers the ◎
+    when the ◎'s own bracket is among the legs."""
+    errors: list[str] = []
+    marked = {num for num, _name in final_marks.values()}
+    honmei = (final_marks.get("◎") or (None, ""))[0]
+    bracket_of = {h["number"]: h["bracket"] for h in fixture["horses"]}
+    honmei_covered = False
+    for b in bets:
+        numbers = b.get("numbers") or []
+        if b.get("type") == "枠連":
+            for br in numbers:
+                in_bracket = {
+                    h["number"] for h in fixture["horses"] if h["bracket"] == br
+                }
+                if not in_bracket & marked:
+                    errors.append(f"枠連 の枠 {br} には最終印の馬が1頭もいません")
+            if honmei is not None and bracket_of.get(honmei) in numbers:
+                honmei_covered = True
+        else:
+            for num in numbers:
+                if num not in marked:
+                    errors.append(
+                        f"{b.get('type')} の馬番 {num} は最終印（◎○▲△）に含まれません"
+                    )
+            if honmei is not None and honmei in numbers:
+                honmei_covered = True
+    if honmei is not None and not honmei_covered:
+        errors.append(f"最終◎ {honmei} を含む買い目が1つもありません")
+    return errors
+
+
+def _final_marks_block(final_marks: dict, probs_by_number: dict) -> str:
+    lines = []
+    for mk in MARKS:
+        if mk in final_marks:
+            num, name = final_marks[mk]
+            p = probs_by_number.get(num)
+            pct = f" 勝率{p[0]}% 3着内{p[1]}%" if p else ""
+            lines.append(f"{mk} {num} {name}{pct}")
+    return "\n".join(lines)
+
+
+def _regen_prompt(persona: dict, final_marks: dict, probs_by_number: dict,
+                  errors: list[str], cap: int | None) -> str:
+    limit = (
+        f"合計は {cap:,} 点以内" if cap is not None else "合計は必ず1,000円ちょうど"
+    )
+    return (
+        "討論の結果、あなたの最終票は次のとおり確定しましたが、初期予想の買い目が"
+        "最終票と矛盾しています。\n\n【最終票】\n"
+        + _final_marks_block(final_marks, probs_by_number)
+        + "\n\n【矛盾の内容】\n"
+        + "\n".join(f"- {e}" for e in errors)
+        + "\n\n買い目だけを出し直してください。最終票の4頭だけを使って組み立て"
+        "（枠連は枠番で構いません）、最終◎を含む買い目を必ず1つ以上入れてください。"
+        f"金額は100単位で、{limit}にしてください。次の形式のみで出力してください:\n"
+        "【買い目】\n単勝 7 500\n3連複 1-7-11 500"
+    )
+
+
+def _regen_bets_cloud(prov, persona: dict, fixture: dict, final_marks: dict,
+                      probs_by_number: dict, errors: list[str],
+                      cap: int | None) -> list[dict] | None:
+    """Bets-only regeneration for a free-text persona: one
+    error-feedback retry, then None (the caller falls back)."""
+    system = (
+        f"あなたは {persona['display']} です。競馬予想AIとして、確定した"
+        "最終票に整合する買い目だけを、指定の形式で出し直します。"
+    )
+    user = _regen_prompt(persona, final_marks, probs_by_number, errors, cap)
+    for _attempt in range(2):
+        try:
+            text = prov.chat(system, user)
+        except Exception as exc:  # noqa: BLE001 - regeneration is best-effort
+            print(f"[bets regen failed for {persona['username']}: {exc}]",
+                  file=sys.stderr)
+            return None
+        section = extract_bets(text, limit=100000)
+        if not section:
+            errs = ["【買い目】のセクションがありません"]
+            bets: list[dict] = []
+        else:
+            bets, perr = parse_bet_lines(section)
+            errs = (
+                perr
+                + validate_bets(bets, fixture, max_total=cap)
+                + bet_consistency_errors(bets, final_marks, fixture)
+            )
+        if not errs:
+            return bets
+        user += (
+            "\n\n【重要】前回の出力に次の問題がありました: "
+            + " / ".join(errs)
+            + "\nすべて直して買い目だけを出し直してください。"
+        )
+    return None
+
+
+def _regen_bets_structured(prov, fixture: dict, final_marks: dict,
+                           probs_by_number: dict, errors: list[str],
+                           cap: int | None) -> list[dict] | None:
+    """Bets-only regeneration for the structured (local) persona, via
+    the same chat_json + error-feedback path as its predictions."""
+    user = _regen_prompt({}, final_marks, probs_by_number, errors, cap) \
+        + "\n買い目は指定されたJSON形式で出力してください。"
+    holder: dict = {}
+
+    def validate(obj: object) -> list[str]:
+        if not isinstance(obj, dict):
+            return ["出力がJSONオブジェクトではありません"]
+        bets: list[dict] = []
+        errs: list[str] = []
+        for b in obj.get("bets") or []:
+            if not isinstance(b, dict):
+                errs.append(f"買い目の形式が不正です: {b}")
+                continue
+            try:
+                numbers = [int(x) for x in str(b.get("combo", "")).split("-")]
+            except ValueError:
+                errs.append(f"買い目の組番を解釈できません: {b.get('combo')}")
+                continue
+            bets.append(
+                {"type": b.get("type"), "numbers": numbers, "amount": b.get("amount")}
+            )
+        errs += validate_bets(bets, fixture, max_total=cap)
+        errs += bet_consistency_errors(bets, final_marks, fixture)
+        if not errs:
+            holder["bets"] = bets
+        return errs
+
+    try:
+        _structured_with_retry(
+            prov, LOCAL_SYSTEM, user, BETS_REGEN_SCHEMA, validate,
+            "bets regeneration",
+        )
+    except Exception as exc:  # noqa: BLE001 - regeneration is best-effort
+        print(f"[bets regen failed (structured): {exc}]", file=sys.stderr)
+        return None
+    return holder.get("bets")
+
+
+def _reconcile_bets(fixture: dict, active: list, predictions: dict,
+                    final_marks: dict, points: dict | None,
+                    cache: dict, save) -> tuple[dict, dict]:
+    """Check every active AI's bets against its final marks and repair
+    the contradicting ones (regenerate, else deterministic rebuild).
+    Returns (final_bets, revisions): final_bets maps every active
+    username to its authoritative structured bets; revisions records,
+    per changed AI, the original bets, the reason, and the method —
+    the audit trail for the swap. Results are cached per AI so a
+    resumed run never re-bills a regeneration."""
+    cache.setdefault("final_bets", {})
+    cache.setdefault("bet_revisions", {})
+    final_bets: dict[str, list[dict]] = {}
+    revisions: dict[str, dict] = {}
+    for persona, prov in active:
+        username = persona["username"]
+        if username in cache["final_bets"]:
+            final_bets[username] = cache["final_bets"][username]
+            if username in cache["bet_revisions"]:
+                revisions[username] = cache["bet_revisions"][username]
+            continue
+        bets, perr = parse_bet_lines(
+            extract_bets(predictions[username], limit=100000)
+        )
+        if perr:  # cannot happen: predictions were validated on entry
+            raise RuntimeError(f"saved bets for {username} do not parse: {perr}")
+        errors = bet_consistency_errors(bets, final_marks[username], fixture)
+        if not errors:
+            final_bets[username] = bets
+            cache["final_bets"][username] = bets
+            save()
+            continue
+        cap = (points or {}).get(username, {}).get("cap")
+        probs = parse_probabilities(predictions[username])
+        probs_by_number = {
+            num: (win, top3) for _mk, (num, win, top3) in probs.items()
+        }
+        if persona.get("structured") and hasattr(prov, "chat_json"):
+            new_bets = _regen_bets_structured(
+                prov, fixture, final_marks[username], probs_by_number, errors, cap
+            )
+        else:
+            new_bets = _regen_bets_cloud(
+                prov, persona, fixture, final_marks[username],
+                probs_by_number, errors, cap,
+            )
+        method = "regenerated"
+        if new_bets is None:
+            marks = final_marks[username]
+            ranking = [
+                (marks[mk][0], {"name": marks[mk][1]})
+                for mk in MARKS if mk in marks
+            ]
+            total = sum(b["amount"] for b in bets) or (cap or 1000)
+            new_bets = build_final_bet(ranking, fixture, total=total)
+            method = "deterministic-fallback"
+        revisions[username] = {
+            "original_bets": bets,
+            "final_bets": new_bets,
+            "reason": " / ".join(errors),
+            "method": method,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        final_bets[username] = new_bets
+        cache["final_bets"][username] = new_bets
+        cache["bet_revisions"][username] = revisions[username]
+        save()
+    return final_bets, revisions
+
+
 def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                                cache: dict | None = None, save=None,
                                points: dict | None = None) -> dict:
     """Generate every text (predictions, debate, final ballots, conclusion)
-    before anything is posted. Any validation failure raises, so an invalid
-    run posts nothing at all.
+    before anything is posted.
+
+    Failure policy (2026-11-05 user decisions): an AI whose generation
+    fails irrecoverably at any stage is EXCLUDED from the race and the
+    rest proceed; only an exclusion that would leave fewer than two
+    active AIs aborts the run (before anything is posted, as before).
+    After the final ballots, each AI's bets are reconciled against its
+    final marks (see _reconcile_bets).
 
     Generation is incremental (re-review 2026-11-04, finding 4): each AI's
     prediction, debate+ballot, and the MC prose are stored into `cache`
@@ -913,6 +1280,37 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             + "\n（買い目は持ち点から賭けます。当たれば実際の配当で増え、外れれば賭けた分が減ります）"
         )
 
+    # --- roster management: an AI whose generation fails irrecoverably
+    # is EXCLUDED from this race instead of aborting the whole run
+    # (2026-11-05 user decision: one AI's bad output must not kill a
+    # race the others completed fine). The floor is two active AIs: an
+    # exclusion that would leave fewer aborts the run as before.
+    # Exclusions are decided per generation pass and recorded in the
+    # returned dict (hence in the state); they are deliberately NOT
+    # cached in `gen` — a resumed run gives a previously failing AI
+    # another chance, since provider failures are often transient.
+    active: list = list(built)
+    excluded: list[dict] = []
+
+    def _exclude(persona, stage: str, reason: str) -> None:
+        username = persona["username"]
+        active[:] = [p for p in active if p[0]["username"] != username]
+        excluded.append(
+            {
+                "username": username,
+                "display": persona["display"],
+                "stage": stage,
+                "reason": reason,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+        )
+        print(f"[excluded {username} at {stage}: {reason}]", file=sys.stderr)
+        if not active or (len(active) < 2 and len(built) >= 2):
+            raise RuntimeError(
+                f"aborting: excluding {username} ({stage}: {reason}) leaves "
+                f"{len(active)} active AI(s)"
+            )
+
     # --- initial predictions (validated for every provider) ---
     predictions: dict[str, str] = {}
     for persona, prov in built:
@@ -920,46 +1318,29 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         if username in cache["predictions"]:
             predictions[username] = cache["predictions"][username]
             continue
-        system = SYSTEM_TEMPLATE.format(display=persona["display"])
-        user = f"次のレースの予想をしてください。\n\n{body}"
         balance = cap = None
         if points and username in points:
             balance = points[username]["balance"]
             cap = points[username]["cap"]
-        user += budget_line(balance, cap)
-        if persona.get("structured") and hasattr(prov, "chat_json"):
-            predictions[username] = generate_structured_prediction(
-                prov, fixture, balance=balance, cap=cap
-            )
-            cache["predictions"][username] = predictions[username]
-            _save()
-            continue
-        text = prov.chat(system, user)
-        errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
-        if errors:
-            print(f"[prediction retry for {username}: {errors}]", file=sys.stderr)
-            retry = prov.chat(
-                system,
-                user
-                + "\n\n【重要】前回の出力に次の問題がありました: "
-                + " / ".join(errors)
-                + "\nすべて直して、印4つ（◎○▲△、すべて異なる実在の馬、各印に勝率と3着内率）と"
-                "【買い目】（券種ごとの頭数を守り、金額は100単位・上限以内）"
-                "を含む完全な予想を出し直してください。",
-            )
-            errors = prediction_errors(retry, fixture, max_total=cap) if retry.strip() else ["再生成の出力が空でした"]
-            if errors:
-                raise RuntimeError(
-                    f"prediction from {username} failed validation after retry: {errors}"
+        try:
+            if persona.get("structured") and hasattr(prov, "chat_json"):
+                text = generate_structured_prediction(
+                    prov, fixture, balance=balance, cap=cap
                 )
-            text = retry
+            else:
+                text = _generate_text_prediction(
+                    prov, persona, fixture, body, balance, cap
+                )
+        except Exception as exc:  # noqa: BLE001 - exclusion, not abort
+            _exclude(persona, "prediction", f"{type(exc).__name__}: {exc}")
+            continue
         predictions[username] = text
         cache["predictions"][username] = text
         _save()
 
     initial_marks = {
         p["username"]: canonical_marks(predictions[p["username"]], fixture)
-        for p, _ in built
+        for p, _ in active
     }
 
     # --- debate + final ballots ---
@@ -967,102 +1348,45 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     final_marks: dict[str, dict] = {}
     for persona, prov in built:
         username = persona["username"]
+        if username not in predictions:
+            continue  # excluded at the prediction stage
         if username in cache["debate"] and username in cache["final_marks"]:
             debate[username] = cache["debate"][username]
             final_marks[username] = {
                 mk: tuple(v) for mk, v in cache["final_marks"][username].items()
             }
             continue
-        others = "\n\n".join(
-            f"--- {p['display']} の予想 ---\n{predictions[p['username']]}"
-            for p, _ in built
-            if p["username"] != username
-        )
-        # The local model generates slowly and its context is precious:
-        # for the structured persona, trim the debate prompt (shorter
-        # form lines, other predictions excerpted) and cap the reply
-        # budget. Cloud personas keep the full context. (The untrimmed
-        # prompt plus a 4096-token context made the local debate call
-        # hit its 600s timeout in the 2026-11-05 Monbetsu 12R dry run.)
-        prompt_body, prompt_others, chat_budget = body, others, None
-        if persona.get("structured"):
-            prompt_body = race_text(fixture, form_limit=3)
-            prompt_others = "\n\n".join(
-                f"--- {p['display']} の予想 ---\n{predictions[p['username']][:500]}"
-                for p, _ in built
-                if p["username"] != username
+        try:
+            text, marks = _generate_debate_and_ballot(
+                prov, persona, fixture, body, predictions, built
             )
-            chat_budget = 2500
-        system = SYSTEM_TEMPLATE.format(display=persona["display"])
-        user = (
-            "他のAIの予想が出そろいました。元の出走データと各AIの予想を踏まえて、"
-            "議論として応答してください。最も同意できる点と最も異論のある点を"
-            "具体的に挙げてください。\n"
-            "最後に、議論を踏まえたあなたの最終票を必ず次の形式で書いてください"
-            "（買い目は初期予想から変えません。最終票はすべて異なる実在の馬にしてください）:\n"
-            "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
-            f"【元の出走データ】\n{prompt_body}\n\n"
-            f"【自分の予想】\n{predictions[username]}\n\n【他のAIの予想】\n{prompt_others}"
-        )
-        text = prov.chat(system, user, max_tokens=chat_budget)
-        if not text.strip():
-            raise RuntimeError(f"empty debate reply from {username}")
-        debate[username] = text
-        if persona.get("structured") and hasattr(prov, "chat_json"):
-            context = (
-                "次のレースについて、他のAIとの議論を踏まえた最終票をJSONで出してください。\n\n"
-                f"【元の出走データ】\n{race_text(fixture, form_limit=3)}\n\n"
-                f"【自分の予想】\n{predictions[username]}\n\n"
-                f"【他のAIの予想（抜粋）】\n{prompt_others}\n\n【自分の議論】\n{text[:800]}"
-            )
-            ballot = generate_structured_ballot(prov, fixture, context)
-            final_marks[username] = ballot
-            # Publish the validated structured ballot, not whatever the
-            # free-form debate prose happened to claim (finding 1).
-            debate[username] = splice_ballot(text, ballot)
-            cache["debate"][username] = debate[username]
-            cache["final_marks"][username] = {
-                mk: list(v) for mk, v in ballot.items()
-            }
-            _save()
+        except Exception as exc:  # noqa: BLE001 - exclusion, not abort
+            stage = getattr(exc, "stage", "debate")
+            _exclude(persona, stage, f"{type(exc).__name__}: {exc}")
             continue
-        marks, errors = _ballot_errors(text, fixture)
-        if errors:
-            print(f"[ballot retry for {username}: {errors}]", file=sys.stderr)
-            retry = prov.chat(
-                system,
-                "最終票だけを出し直してください。前回の問題: "
-                + " / ".join(errors)
-                + "\n次の形式のみで出力してください:\n"
-                "【最終票】\n◎ 馬番 馬名\n○ 馬番 馬名\n▲ 馬番 馬名\n△ 馬番 馬名\n\n"
-                f"【元の出走データ】\n{body}",
-            )
-            marks, errors = _ballot_errors(retry, fixture)
-            if errors:
-                raise RuntimeError(
-                    f"final ballot from {username} failed validation after retry: {errors}"
-                )
-            head = text.rfind("【最終票】")
-            base = text[:head].rstrip() if head >= 0 else text.rstrip()
-            debate[username] = base + "\n\n" + retry.strip()
-        names = {h["number"]: h["name"] for h in fixture["horses"]}
-        final_marks[username] = {
-            mk: (num, names.get(num, name)) for mk, (num, name) in marks.items()
-        }
-        cache["debate"][username] = debate[username]
+        debate[username] = text
+        final_marks[username] = marks
+        cache["debate"][username] = text
         cache["final_marks"][username] = {
-            mk: list(v) for mk, v in final_marks[username].items()
+            mk: list(v) for mk, v in marks.items()
         }
         _save()
 
+    # --- reconcile bets against the final marks ---
+    final_bets, bet_revisions = _reconcile_bets(
+        fixture, active, predictions, final_marks, points, cache, _save
+    )
+
     # --- aggregation over the FINAL ballots (initial scores break ties) ---
+    display_of_all = {p["username"]: p["display"] for p, _ in built}
+
     def _scores(marks_by_user: dict) -> dict[int, dict]:
         out: dict[int, dict] = {}
-        for p, _ in built:
-            for mark, (num, name) in marks_by_user[p["username"]].items():
+        for username, marks in marks_by_user.items():
+            for mark, (num, name) in marks.items():
                 entry = out.setdefault(num, {"name": name, "score": 0, "marks": {}})
                 entry["score"] += MARK_SCORE[mark]
-                entry["marks"][p["display"]] = mark
+                entry["marks"][display_of_all.get(username, username)] = mark
         return out
 
     initial_scores = _scores(initial_marks)
@@ -1076,11 +1400,10 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         ),
     )
 
-    bets = {p["username"]: extract_bets(predictions[p["username"]]) for p, _ in built}
     bets_digest = "\n".join(
-        f"{p['display']}: {bets[p['username']].replace(chr(10), ' / ')}"
-        for p, _ in built
-        if bets[p["username"]]
+        f"{p['display']}: {format_bets(final_bets[p['username']]).replace(chr(10), ' / ')}"
+        for p, _ in active
+        if final_bets.get(p["username"])
     )
     final_total = 1000
     if points and MC_USERNAME in points:
@@ -1099,12 +1422,12 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             lines.append(f"・ {num} {info['name']}（最終スコア {info['score']} / 初期 {init}）")
         lines.append("")
         lines.append("各AIの最終本命：")
-        for persona, _ in built:
+        for persona, _ in active:
             m = final_marks[persona["username"]].get("◎")
             if m:
                 lines.append(f"  {persona['display']}: ◎ {m[0]} {m[1]}")
         changed = []
-        for persona, _ in built:
+        for persona, _ in active:
             before = initial_marks[persona["username"]].get("◎")
             after = final_marks[persona["username"]].get("◎")
             if before and after and before[0] != after[0]:
@@ -1117,8 +1440,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             lines.extend(changed)
         else:
             lines.append("討論でも各AIの本命は変わりませんでした。")
+        if excluded:
+            lines.append("")
+            lines.append("不参加のAI（生成エラーにより除外）:")
+            for e in excluded:
+                lines.append(f"  {e['display']}（{e['stage']}段階で除外）")
         fair_lines = []
-        for persona, _ in built:
+        for persona, _ in active:
             probs = parse_probabilities(predictions[persona["username"]])
             honmei = initial_marks[persona["username"]].get("◎")
             p0 = probs.get("◎")
@@ -1146,7 +1474,7 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             try:
                 debate_digest = "\n\n".join(
                     f"--- {p['display']} の議論 ---\n{debate[p['username']][:400]}"
-                    for p, _ in built
+                    for p, _ in active
                 )
                 prose = mc_provider.chat(
                     "あなたは競馬予想の議論スレッドの司会AIです。各AIの議論を読み、"
@@ -1167,6 +1495,12 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             conclusion += "\n\n【司会総括（ローカルLLM）】\n" + prose
     if bets_digest:
         conclusion += "\n\n【各AIの買い目】\n" + bets_digest
+    if bet_revisions:
+        conclusion += "\n\n【買い目の差し替え】\n" + "\n".join(
+            f"  {display_of_all.get(u, u)}: 最終票と矛盾したため買い目を再構成しました"
+            f"（{rev['method']}）"
+            for u, rev in bet_revisions.items()
+        )
     if final_bet:
         conclusion += "\n\n【最終買い目（結論口座）】\n" + format_bets(final_bet)
     if points:
@@ -1198,7 +1532,15 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             {"number": num, "name": info["name"], "score": info["score"]}
             for num, info in ranking
         ],
-        "bets": bets,
+        # "bets" (text form) and "final_bets" (structured) both carry
+        # the RECONCILED bets — the ones consistent with the final
+        # marks. Settlement reads final_bets; the original slips remain
+        # visible in the prediction posts themselves and, for changed
+        # AIs, in bet_revisions.
+        "bets": {u: format_bets(bs) for u, bs in final_bets.items()},
+        "final_bets": final_bets,
+        "bet_revisions": bet_revisions,
+        "excluded": excluded,
         "final_bet": format_bets(final_bet) if final_bet else None,
     }
 
@@ -1250,11 +1592,15 @@ def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
     ids.setdefault("debate", {})
     for persona, _ in built:
         u = persona["username"]
+        if u not in texts["predictions"]:
+            continue  # excluded during generation: nothing to post
         if u not in ids["predictions"]:
             ids["predictions"][u] = emitter.emit(u, texts["predictions"][u], root_id)
             store.save()
     for persona, _ in built:
         u = persona["username"]
+        if u not in texts["debate"]:
+            continue  # excluded during generation: nothing to post
         if u not in ids["debate"]:
             ids["debate"][u] = emitter.emit(u, texts["debate"][u], root_id)
             store.save()
@@ -1338,6 +1684,14 @@ def build_review_text(fixture: dict, results: dict, state: dict | None) -> str:
             f"3連複 {list(payouts['trio'].values())[0]}円"
         )
     lines.append("")
+    if state and state.get("excluded"):
+        lines.append(
+            "不参加のAI（生成段階で除外され、精算・反省の対象外）: "
+            + "、".join(
+                f"@{e['username']}（{e.get('stage', '?')}段階）"
+                for e in state["excluded"]
+            )
+        )
     if state and state.get("conclusion_ranking"):
         best = state["conclusion_ranking"][0]
         actual = {f["number"]: f["position"] for f in results["finish"]}
@@ -1467,10 +1821,25 @@ def settle_race_points(fixture: dict, results: dict, state: dict,
     race_name = state.get("race") or ""
     records: dict[str, dict] = {}
     texts = (state.get("texts") or {}).get("predictions") or {}
+    # The reconciled bets (state["final_bets"]) are authoritative: they
+    # are the slips consistent with each AI's final marks. States saved
+    # before reconciliation existed fall back to parsing the prediction
+    # text, as before.
+    final_bets_map = state.get("final_bets") or {}
     for username, text in texts.items():
-        bets, perr = parse_bet_lines(extract_bets(text, limit=100000))
-        if perr:
-            raise RuntimeError(f"saved bets for {username} do not parse: {perr}")
+        if username in final_bets_map:
+            bets = [
+                {
+                    "type": b["type"],
+                    "numbers": list(b["numbers"]),
+                    "amount": int(b["amount"]),
+                }
+                for b in final_bets_map[username]
+            ]
+        else:
+            bets, perr = parse_bet_lines(extract_bets(text, limit=100000))
+            if perr:
+                raise RuntimeError(f"saved bets for {username} do not parse: {perr}")
         total_return = 0
         for b in bets:
             ret = bet_return(b, fixture, results)
