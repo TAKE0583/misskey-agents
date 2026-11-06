@@ -4,3 +4,4 @@ runs/
 __pycache__/
 *.py[cod]
 fixtures/person-stats-cache.json
+data/
