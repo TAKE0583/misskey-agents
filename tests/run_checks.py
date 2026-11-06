@@ -690,6 +690,13 @@ if _bf is not None:
           _bf.parse_win_odds(
               {"data": {"odds": {"1": {"7": ["2.9", "0", "1"], "3": ["---"]}}}})
           == {7: 2.9})
+    check("odds api: NAR ary_odds shape parsed (live 2026-11-06)",
+          _bf.parse_win_odds(
+              {"status": "OK", "odds_status": "real",
+               "ary_odds": {"01": {"Odds": "52.6", "Ninki": "10"},
+                            "02": {"Odds": "6.5", "Ninki": "3"},
+                            "03": {"Odds": "---", "Ninki": "9"}}})
+          == {1: 52.6, 2: 6.5})
     check("odds api: pre-sale payload is empty, not an error",
           _bf.parse_win_odds({"data": ""}) == {}
           and _bf.parse_win_odds({}) == {})

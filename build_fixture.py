@@ -121,27 +121,46 @@ def fetch_recent_form(race_id: str, nar: bool = False) -> dict[int, list[str]]:
 
 
 def parse_win_odds(payload: object) -> dict[int, float]:
-    """Extract {horse number: win odds} from a netkeiba odds API payload
-    (the same JSON shape the vendor odds parser reads: data.odds["1"]
-    maps horse number -> [odds, ?, popularity]). Anything unexpected —
-    including the empty payload served before betting opens — yields
-    an empty dict rather than an error."""
+    """Extract {horse number: win odds} from a netkeiba odds API payload.
+    Two shapes are handled: the JRA shape (the same JSON the vendor
+    odds parser reads: data.odds["1"] maps horse number ->
+    [odds, ?, popularity]) and the NAR host shape (ary_odds maps
+    zero-padded number -> {"Odds": ..., "Ninki": ...}). Anything
+    unexpected — including the empty payload served before betting
+    opens — yields an empty dict rather than an error."""
     if not isinstance(payload, dict):
         return {}
     data = payload.get("data")
-    if not isinstance(data, dict):
-        return {}
-    tan = (data.get("odds") or {}).get("1") or {}
-    out: dict[int, float] = {}
-    for num, vals in tan.items():
-        try:
-            odds = float(vals[0])
-            number = int(num)
-        except (TypeError, ValueError, IndexError):
-            continue
-        if odds > 0:  # negative values mark scratched/excluded runners
-            out[number] = odds
-    return out
+    if isinstance(data, dict):
+        tan = (data.get("odds") or {}).get("1") or {}
+        out: dict[int, float] = {}
+        for num, vals in tan.items():
+            try:
+                odds = float(vals[0])
+                number = int(num)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if odds > 0:  # negative values mark scratched/excluded runners
+                out[number] = odds
+        if out:
+            return out
+    # NAR host shape (confirmed live 2026-11-06: api_get_nar_odds.html
+    # answers with real odds, but in its own shape, not the JRA one):
+    # {"status": "OK", "odds_status": "real",
+    #  "ary_odds": {"01": {"Odds": "52.6", "Ninki": "10"}, ...}}
+    ary = payload.get("ary_odds")
+    if isinstance(ary, dict):
+        out = {}
+        for num, vals in ary.items():
+            try:
+                odds = float((vals or {}).get("Odds"))
+                number = int(num)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if odds > 0:
+                out[number] = odds
+        return out
+    return {}
 
 
 def devig_win_probs(odds_by_number: dict[int, float]) -> dict[int, float]:
