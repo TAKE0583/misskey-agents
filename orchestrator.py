@@ -57,6 +57,61 @@ LOCAL_PERSONA = {
 MARKS = ["◎", "○", "▲", "△"]
 MARK_SCORE = {"◎": 4, "○": 3, "▲": 2, "△": 1}
 
+# --- Top-grade model upgrade (user decision 2026-11-07) -------------------
+# For G1 and JpnI races only, the cloud personas run on each provider's
+# flagship model instead of the everyday default: the user wants the
+# best available judgment on the biggest races, and top-grade races are
+# rare enough that the extra cost (~$0.3-0.6 per race) is negligible.
+# @gemini already runs its flagship (gemini-3.1-pro-preview) and @local
+# is capped by take-pc's VRAM (qwen3:14b), so neither changes. Reviews
+# of top-grade races follow the same rule (same fixture), and the
+# effective models are recorded in the run state.
+TOP_GRADE_MODELS = {
+    "chatgpt": "gpt-6-astra",      # OpenAI flagship ($10/$50 per MTok)
+    "claude": "claude-fable-5-1",  # Anthropic flagship ($10/$50 per MTok)
+}
+_TOP_GRADE_KEYS = {"G1", "JPN1", "JG1"}  # JG1: jump G1 (Nakayama Grand Jump)
+_GRADE_TRANSLATE = str.maketrans({"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3"})
+_ROMAN_DIGITS = {"I": "1", "II": "2", "III": "3"}
+
+
+def _grade_key(grade: str) -> str:
+    """Canonical grade key: 'JpnI' / 'JpnⅠ' / 'Jpn1' all become 'JPN1',
+    'GⅠ' / 'GI' become 'G1', 'J.G1' becomes 'JG1'. (The roman numeral
+    is a digit in G1 but a letter in JpnI, so both forms are unified
+    to the digit form.)"""
+    g = grade.strip().upper().replace(".", "").translate(_GRADE_TRANSLATE)
+    for prefix in ("JPN", "JG", "G"):
+        if g.startswith(prefix):
+            rest = g[len(prefix):]
+            return prefix + _ROMAN_DIGITS.get(rest, rest)
+    return g
+
+
+def is_top_grade(fixture: dict) -> bool:
+    """True for G1 / JpnI fixtures (incl. the J.G1 jump grade), whatever
+    spelling the fixture carries ('G1', 'GⅠ', 'JpnI', 'JpnⅠ', 'J.G1')."""
+    grade = str((fixture.get("race") or {}).get("grade") or "")
+    return _grade_key(grade) in _TOP_GRADE_KEYS
+
+
+def apply_top_grade_models(fixture: dict, built) -> dict:
+    """Swap cloud providers to their flagship models for top-grade
+    races. Returns {username: effective model} for every built persona
+    (None for personas without a remote model, e.g. mock)."""
+    effective = {}
+    top = is_top_grade(fixture)
+    for persona, prov in built:
+        username = persona["username"]
+        model = getattr(prov, "model", None) or getattr(
+            prov, "default_model", None)
+        if (top and username in TOP_GRADE_MODELS
+                and getattr(prov, "default_model", None)):
+            prov.model = TOP_GRADE_MODELS[username]
+            model = prov.model
+        effective[username] = model
+    return effective
+
 # --- Market anchor, conclusion gate, A/B measurement (2026-11-05) --------
 # Adopted from the prior-art survey (research report §4, items 1/2/4).
 # The closing market is a strong, well-calibrated forecast, so:
@@ -2838,6 +2893,10 @@ def main() -> int:
     roster = PERSONAS + ([LOCAL_PERSONA] if args.local else [])
     built = build_providers(mock=args.mock, roster=roster)
     preflight(built, live=live)
+    effective_models = apply_top_grade_models(fixture, built)
+    if is_top_grade(fixture):
+        print(f"[top-grade race: models {effective_models}]",
+              file=sys.stderr)
 
     if args.review:
         if not args.results:
@@ -2876,6 +2935,9 @@ def main() -> int:
         )
         check_race_identity(fixture, None, store.data)
         _backfill_race_id(store, fixture)
+        if store.data.get("models") != effective_models:
+            store.data["models"] = effective_models
+            store.save()
         if store.data.get("stage") == "complete" and not args.force:
             raise SystemExit(
                 "prediction already completed for this race "

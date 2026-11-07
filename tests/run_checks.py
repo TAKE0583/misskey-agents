@@ -741,6 +741,38 @@ if _bf is not None:
 else:
     print("SKIP odds checks (build_fixture needs the venv python)")
 
+# --- top-grade model upgrade (user decision 2026-11-07: G1 / JpnI races
+# run on each provider's flagship model; everything else is unchanged)
+check("top grade: G1/JpnI/J.G1 qualify in any spelling",
+      o.is_top_grade({"race": {"grade": "G1"}})
+      and o.is_top_grade({"race": {"grade": "JpnI"}})
+      and o.is_top_grade({"race": {"grade": "JpnⅠ"}})
+      and o.is_top_grade({"race": {"grade": "J.G1"}})
+      and o.is_top_grade(jbc))
+check("top grade: lesser grades do not qualify",
+      not o.is_top_grade({"race": {"grade": "G2"}})
+      and not o.is_top_grade({"race": {"grade": "G3"}})
+      and not o.is_top_grade({"race": {"grade": "OP"}})
+      and not o.is_top_grade({"race": {"grade": "JpnII"}})
+      and not o.is_top_grade({"race": {"grade": "A2"}})
+      and not o.is_top_grade({"race": {}}))
+_built_top = [(p, p["provider"]()) for p in o.PERSONAS]
+_eff_top = o.apply_top_grade_models(jbc, _built_top)
+check("top grade: flagship models applied to chatgpt/claude only",
+      _eff_top == {"chatgpt": "gpt-6-astra",
+                   "claude": "claude-fable-5-1",
+                   "gemini": "gemini-3.1-pro-preview"}
+      and _built_top[0][1].model == "gpt-6-astra"
+      and _built_top[1][1].model == "claude-fable-5-1"
+      and _built_top[2][1].model == "gemini-3.1-pro-preview")
+_built_norm = [(p, p["provider"]()) for p in o.PERSONAS]
+_eff_norm = o.apply_top_grade_models({"race": {"grade": "G2"}}, _built_norm)
+check("top grade: ordinary grades keep the default models",
+      _eff_norm == {"chatgpt": "gpt-5-mini",
+                    "claude": "claude-sonnet-5",
+                    "gemini": "gemini-3.1-pro-preview"}
+      and _built_norm[0][1].model == "gpt-5-mini")
+
 import copy as _copy
 
 _names = {h["number"]: h["name"] for h in monbetsu["horses"]}
@@ -1345,6 +1377,58 @@ check("person stats: race text renders the compact stats segment",
 check("person stats: missing stats keep the name-only runner line",
       o.person_stats_text(monbetsu["horses"][0]) == ""
       and "騎手（" not in o.race_text(monbetsu))
+
+# --- top-grade model upgrade (2026-11-07: G1 / JpnI run on flagships) ---
+check("grade key: spellings unify to digit form",
+      o._grade_key("G1") == "G1" and o._grade_key("GⅠ") == "G1"
+      and o._grade_key("GI") == "G1"
+      and o._grade_key("JpnI") == "JPN1" and o._grade_key("JpnⅠ") == "JPN1"
+      and o._grade_key("Jpn1") == "JPN1"
+      and o._grade_key("J.G1") == "JG1"
+      and o._grade_key("JpnII") == "JPN2" and o._grade_key("JpnIII") == "JPN3"
+      and o._grade_key("G2") == "G2" and o._grade_key("OP") == "OP"
+      and o._grade_key("") == "")
+check("grade key: G1 / JpnI / jump G1 are top grade",
+      o.is_top_grade({"race": {"grade": "G1"}})
+      and o.is_top_grade({"race": {"grade": "JpnI"}})
+      and o.is_top_grade({"race": {"grade": "J.G1"}})
+      and o.is_top_grade(jbc))
+check("grade key: lesser grades are not top grade",
+      not o.is_top_grade({"race": {"grade": "G2"}})
+      and not o.is_top_grade({"race": {"grade": "G3"}})
+      and not o.is_top_grade({"race": {"grade": "OP"}})
+      and not o.is_top_grade({"race": {"grade": "JpnII"}})
+      and not o.is_top_grade({"race": {"grade": ""}})
+      and not o.is_top_grade(monbetsu)
+      and not o.is_top_grade({}))
+
+
+class _StubProv:
+    def __init__(self, default):
+        self.model = None
+        self.default_model = default
+
+
+def _stub_built():
+    return [(p, _StubProv(d)) for p, d in zip(
+        o.PERSONAS,
+        ["gpt-5-mini", "claude-sonnet-5", "gemini-3.1-pro-preview"])]
+
+
+_top_built = _stub_built()
+_eff = o.apply_top_grade_models({"race": {"grade": "JpnI"}}, _top_built)
+check("top grade: chatgpt/claude swap to flagships, gemini untouched",
+      _eff == {"chatgpt": "gpt-6-astra", "claude": "claude-fable-5-1",
+               "gemini": "gemini-3.1-pro-preview"}
+      and _top_built[0][1].model == "gpt-6-astra"
+      and _top_built[1][1].model == "claude-fable-5-1"
+      and _top_built[2][1].model is None)
+_norm_built = _stub_built()
+_eff = o.apply_top_grade_models({"race": {"grade": "G2"}}, _norm_built)
+check("normal grade: models stay at the everyday defaults",
+      _eff == {"chatgpt": "gpt-5-mini", "claude": "claude-sonnet-5",
+               "gemini": "gemini-3.1-pro-preview"}
+      and all(p.model is None for _, p in _norm_built))
 
 print()
 if fails:
