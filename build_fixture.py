@@ -183,7 +183,16 @@ def fetch_win_odds(race_id: str, nar: bool = False) -> dict[int, float]:
     must build fine without them — any failure returns {} and the
     caller stamps null market fields. The NAR host's API endpoint name
     could not be verified offline, so both candidate names are tried
-    and whichever answers with data wins."""
+    and whichever answers with data wins.
+
+    JRA quirk (verified live 2026-11-07): api_get_jra_odds.html only
+    serves live interim odds when called the way the odds page's own
+    updater calls it — pid=api_get_jra_odds & action=init (status
+    "middle" with data.odds populated). A bare call answers in
+    result-odds mode: {"status": "middle", "data": "",
+    "reason": "result odds empty"} before the race and real odds only
+    after it finishes. That is why the 2026-11-07 Fukushima/Tokyo
+    fixtures carried no market data until this call form was used."""
     if nar:
         urls = [
             f"{NAR_RACE_URL}/api/api_get_nar_odds.html?race_id={race_id}&type=1",
@@ -191,7 +200,10 @@ def fetch_win_odds(race_id: str, nar: bool = False) -> dict[int, float]:
         ]
     else:
         urls = [
-            f"{JRA_RACE_URL}/api/api_get_jra_odds.html?race_id={race_id}&type=1"
+            f"{JRA_RACE_URL}/api/api_get_jra_odds.html"
+            f"?pid=api_get_jra_odds&input=UTF-8&output=json"
+            f"&race_id={race_id}&type=1&action=init&sort=odds&compress=0",
+            f"{JRA_RACE_URL}/api/api_get_jra_odds.html?race_id={race_id}&type=1",
         ]
     for url in urls:
         try:

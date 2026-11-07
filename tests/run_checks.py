@@ -700,6 +700,44 @@ if _bf is not None:
     check("odds api: pre-sale payload is empty, not an error",
           _bf.parse_win_odds({"data": ""}) == {}
           and _bf.parse_win_odds({}) == {})
+    check("odds api: JRA live interim payload parsed (status middle)",
+          _bf.parse_win_odds(
+              {"status": "middle",
+               "data": {"official_datetime": "2026-11-07 14:25:41",
+                        "odds": {"1": {"01": ["47.8", "0", "15"],
+                                       "04": ["5.1", "0", "1"]},
+                                 "2": {"01": ["18.2", "22.9", "17"]}}}})
+          == {1: 47.8, 4: 5.1})
+    check("odds api: bare-call result-mode payload is empty",
+          _bf.parse_win_odds({"status": "middle", "data": "",
+                              "reason": "result odds empty"}) == {})
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    _seen_urls = []
+    _orig_get = _bf.requests.get
+
+    def _fake_get(url, headers=None, timeout=None):
+        _seen_urls.append(url)
+        return _FakeResp({"status": "middle",
+                          "data": {"odds": {"1": {"9": ["3.4", "0", "1"]}}}})
+
+    _bf.requests.get = _fake_get
+    try:
+        _fetched = _bf.fetch_win_odds("202605050211")
+    finally:
+        _bf.requests.get = _orig_get
+    check("odds api: JRA fetch asks for the live action=init form",
+          _fetched == {9: 3.4} and bool(_seen_urls)
+          and "action=init" in _seen_urls[0])
 else:
     print("SKIP odds checks (build_fixture needs the venv python)")
 
