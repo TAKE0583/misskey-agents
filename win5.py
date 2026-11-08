@@ -22,9 +22,9 @@ only):
   the exact vector the conclusion gate itself uses). This is what
   lets the 2026-11-15 Kyoto 11R leg resolve to the QE Cup state
   (fixtures/2026-elizabeth-cup.json) instead of a stem guess.
-- Ticket generation (allocate_win5): budget is
-  min(2000, the conclusion account's points cap) — the cap being
-  points.py's 30%-of-balance rule — at 100 points per combination.
+- Ticket generation (allocate_win5): budget is a flat 2,000 points
+  (decoupled scoreboard, 2026-11-08 — never derived from the
+  conclusion account's balance) at 100 points per combination.
   Every leg starts with its top-probability horse; a greedy allocator
   then repeatedly adds the pick that buys the most log(hit
   probability) per extra combination, at most 4 picks per leg, while
@@ -58,8 +58,9 @@ CLI (mirrors orchestrator.py's mode flags; default is dry-run):
 
 State lives in runs/win5-YYYY-MM-DD-state.json (live) and
 runs/dryrun/win5-YYYY-MM-DD-state.json (dry-run), under a per-date
-flock. Dry-run never posts and never writes any points ledger (the
-live ledger is only READ, for a realistic budget figure).
+flock. Dry-run never posts and never touches any points ledger;
+generation reads no ledger at all (the budget is a flat constant),
+and only live settlement writes to the ledger.
 """
 from __future__ import annotations
 
@@ -83,7 +84,7 @@ WIN5_RESULT_URL = "https://race.netkeiba.com/top/win5.html"
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
 ACCOUNT = "shikai"  # the conclusion account (orchestrator.MC_USERNAME)
-MAX_STAKE_POINTS = 2000
+BUDGET_POINTS = 2000  # flat per-day WIN5 budget, balance-independent
 UNIT_POINTS = 100
 MAX_PICKS_PER_LEG = 4
 N_LEGS = 5
@@ -585,7 +586,7 @@ def run_win5(date_str: str, live: bool, *, html: str | None = None,
     """Generate (and in live mode post) the day's WIN5 ticket.
 
     Outcomes are recorded in the state and returned: stage is one of
-    no_win5 / legs_incomplete / missed_deadline / insufficient_balance
+    no_win5 / legs_incomplete / missed_deadline
     / ticket_generated / ticket_posted / settled. A date that already
     has a ticket is never regenerated; a ticket_generated live state
     whose note never posted (crash) is posted on re-entry, with the
@@ -631,26 +632,16 @@ def run_win5(date_str: str, live: bool, *, html: str | None = None,
                 data["stage"] = "missed_deadline"
                 store.save()
                 return data
-            # Read-only use of the live ledger: balance/cap never write.
-            ledger = points_mod.PointsLedger(
-                points_mod.ledger_path(True)
-            )
-            balance = ledger.balance(ACCOUNT)
-            budget = min(MAX_STAKE_POINTS, ledger.cap(ACCOUNT))
-            if budget < UNIT_POINTS:
-                data["stage"] = "insufficient_balance"
-                data["budget"] = budget
-                data["balance"] = balance
-                store.save()
-                return data
+            # Flat budget (decoupled scoreboard, 2026-11-08): the
+            # conclusion account's balance is never consulted here.
+            budget = BUDGET_POINTS
             vectors = [r["aggregate_probs"] for r in resolved]
             alloc = allocate_win5(vectors, budget)
             if alloc is None:
-                data["stage"] = "insufficient_balance"
-                data["budget"] = budget
-                data["balance"] = balance
-                store.save()
-                return data
+                raise RuntimeError(
+                    "WIN5 allocator returned no ticket for 5 resolved "
+                    f"legs at the flat {budget}-point budget"
+                )
             ticket_legs = []
             for r, leg_picks, cov in zip(
                 resolved, alloc["picks"], alloc["coverage_pct"]
@@ -675,7 +666,6 @@ def run_win5(date_str: str, live: bool, *, html: str | None = None,
                 "stake": alloc["stake"],
                 "hit_prob_pct": alloc["hit_prob_pct"],
                 "budget": budget,
-                "balance_at_generation": balance,
                 "generated_at": _now(),
             }
             data["ticket_text"] = build_ticket_text(data)
@@ -729,7 +719,9 @@ def build_settlement_text(data: dict, record: dict,
         f"収支 {net:+}点"
     )
     if balance_after is not None:
-        lines.append(f"結論口座残高: {balance_after}点")
+        lines.append(
+            f"結論口座の累積収支: {points_mod.format_score(balance_after)}点"
+        )
     else:
         lines.append("（ドライラン: 精算は未実行）")
     return "\n".join(lines)

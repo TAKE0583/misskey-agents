@@ -7,9 +7,17 @@ runs/ for live runs and runs/dryrun/ for dry runs, mirroring the run-state
 separation: a dry run must never move real balances.
 
 Settlement is idempotent per (race_id, username): re-running a review
-never settles the same race twice. An account that falls below 100 points
-cannot place even the minimum bet, so ensure_bettable tops it back up to
-RELIEF_BALANCE once per race, recorded in its history as a relief.
+never settles the same race twice.
+
+Decoupled scoreboard (2026-11-08 user decision): the balance is a pure
+scoreboard, never an input to prediction or betting. The per-race
+stake cap is a flat STAKE_CAP for every account regardless of balance,
+generation prompts carry no balance at all, and there is no relief
+top-up — balances may fall to zero or below, and settlement records
+the exact figure (no flooring). What readers see is the cumulative
+P&L ("score"): balance - INITIAL_BALANCE, via format_score(). The old
+relief entries remain in existing ledgers' history as historical
+record; nothing writes them any more.
 """
 from __future__ import annotations
 
@@ -18,8 +26,24 @@ import time
 from pathlib import Path
 
 INITIAL_BALANCE = 10_000
-RELIEF_BALANCE = 1_000
-STAKE_CAP_RATIO = 0.30
+STAKE_CAP = 3_000
+
+
+def score_of(balance: int) -> int:
+    """Cumulative P&L behind a ledger balance: the scoreboard figure
+    readers see. The internal balance keeps the INITIAL_BALANCE offset
+    so all historical settlement math stays untouched."""
+    return int(balance) - INITIAL_BALANCE
+
+
+def format_score(balance: int) -> str:
+    """Signed score for display, thousands-separated: a balance of
+    39,430 renders '+29,430', 620 renders '-9,380', and exactly
+    INITIAL_BALANCE renders '±0' (the agreed zero form)."""
+    score = score_of(balance)
+    if score == 0:
+        return "±0"
+    return f"{score:+,}"
 
 
 def ledger_path(live: bool) -> Path:
@@ -36,7 +60,7 @@ class PointsLedger:
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
         else:
-            self.data = {"version": 1, "accounts": {}, "settled": {}, "reliefs": {}}
+            self.data = {"version": 1, "accounts": {}, "settled": {}}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,31 +79,19 @@ class PointsLedger:
         return int(self._account(username)["balance"])
 
     def cap(self, username: str) -> int:
-        """Max total stake for one race: 30% of the balance, in 100-point
-        units, never more than the balance itself."""
-        b = self.balance(username)
-        return min(b, int(b * STAKE_CAP_RATIO) // 100 * 100)
+        """Max total stake for one race: a flat STAKE_CAP for every
+        account, whatever its balance (decoupled scoreboard — a losing
+        streak no longer shrinks an AI's betting budget)."""
+        return STAKE_CAP
+
+    def score(self, username: str) -> int:
+        """The account's cumulative P&L (balance - INITIAL_BALANCE)."""
+        return score_of(self.balance(username))
 
     def snapshot(self, usernames: list[str]) -> dict[str, dict]:
         return {
             u: {"balance": self.balance(u), "cap": self.cap(u)} for u in usernames
         }
-
-    def ensure_bettable(self, username: str, race_id: str | None) -> bool:
-        """Relief top-up for an account under the 100-point minimum bet.
-        Once per race; returns True when a top-up was applied."""
-        acct = self._account(username)
-        key = f"{race_id}:{username}"
-        if acct["balance"] >= 100 or key in self.data["reliefs"]:
-            return False
-        acct["balance"] = RELIEF_BALANCE
-        acct["history"].append(
-            {"kind": "relief", "race_id": race_id, "balance": acct["balance"],
-             "at": _now()}
-        )
-        self.data["reliefs"][key] = True
-        self.save()
-        return True
 
     def settle(self, race_id: str, race_name: str, username: str,
                staked: int, returned: int) -> dict:

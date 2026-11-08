@@ -292,6 +292,42 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         os.chdir(cwd)
 
+# flat budget: a near-zero conclusion balance changes nothing
+# (decoupled scoreboard, 2026-11-08 — under the old balance-derived
+# rule this balance would have meant no ticket at all)
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    base_workspace(tmp)
+    add_10r_legs(tmp)
+    broke_ledger = {
+        "version": 1,
+        "accounts": {"shikai": {"balance": 50, "history": []}},
+        "settled": {},
+    }
+    ledger_file = tmp / "runs" / "points.json"
+    ledger_file.write_text(json.dumps(broke_ledger), encoding="utf-8")
+    os.chdir(tmp)
+    try:
+        data = win5.run_win5("2026-11-08", False, html=RACELIST_HTML,
+                             now=BEFORE, legs_runs_dir=tmp / "runs",
+                             fixtures_dir=tmp / "fixtures")
+    finally:
+        os.chdir(cwd)
+    check("run: flat budget with a near-zero conclusion balance",
+          data["stage"] == "ticket_generated"
+          and data["ticket"]["budget"] == 2000,
+          str(data.get("stage")))
+    check("run: ticket records no balance figure",
+          "balance_at_generation" not in data["ticket"])
+    check("run: generation leaves the ledger file untouched",
+          json.loads(ledger_file.read_text("utf-8")) == broke_ledger)
+    check("settlement text: score shown as 累積収支, never raw balance",
+          "累積収支: -9,950点" in win5.build_settlement_text(
+              {"date": "2026-11-08"},
+              {"legs": [], "hit": False, "payout_yen": None,
+               "winning_tickets": None, "staked": 100, "returned": 0},
+              50))
+
 print()
 if fails:
     print(f"{len(fails)} CHECK(S) FAILED: {fails}")

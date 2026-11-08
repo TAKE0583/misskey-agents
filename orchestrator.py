@@ -224,10 +224,10 @@ SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、�
 ○ 馬番 馬名 勝率○% 3着内○% — 理由
 ▲ 馬番 馬名 勝率○% 3着内○% — 理由
 △ 馬番 馬名 勝率○% 3着内○% — 理由
-勝率と3着内率はあなたの推定です。勝率は1〜90%、3着内率は勝率以上99%以下にし、4頭の勝率の合計は100%を超えないでください。人気だけに引きずられず、「勝つ確率が高いのに評価が割れそうな馬」を見抜くことが持ち点を増やす近道です。
+勝率と3着内率はあなたの推定です。勝率は1〜90%、3着内率は勝率以上99%以下にし、4頭の勝率の合計は100%を超えないでください。人気だけに引きずられず、「勝つ確率が高いのに評価が割れそうな馬」を見抜くことが、確率推定の精度を上げる近道です。
 出走馬データに「市場勝率○%」と併記されている数値は、単勝オッズから算出した市場の勝率評価です（併記がないレースでは市場データなし）。あなたの勝率は市場との差（乖離）として捉え、各印の理由では「市場が何を見落としているのか」を、その差の大きさ（ポイント）とともに具体的に述べてください。市場との乖離が大きいほど強い根拠が必要です。根拠が弱い場合は、無理に乖離を作らず市場寄りの評価にしてください。
 出走馬データに「騎手（中央・今季）勝率○% 連対○% 複勝○%」のように併記されている数値は、その騎手・調教師の当該主催（中央/地方）における今季成績です（「通算」とある場合は今季の記録がないための通算成績）。併記がない人物は成績データなしです。騎手の評価は名前の印象ではなく、この数字を根拠にしてください。
-印のあとに、あなた自身が馬券を買うならどう買うかも、必ず次の形式で書いてください（券種・組み合わせ・金額を1行に1点。金額は持ち点から賭ける点数で、上限は別途指示されます）:
+印のあとに、あなた自身が馬券を買うならどう買うかも、必ず次の形式で書いてください（券種・組み合わせ・金額を1行に1点。金額は点数（100点単位）で、上限は別途指示されます）:
 【買い目】
 単勝 7 500
 3連複 1-7-11 500
@@ -299,7 +299,7 @@ BET_SECTION_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?(.*)", re.S)
 
 LOCAL_SYSTEM = """あなたは ローカルLLM（Qwen3） です。競馬予想AIとして、他のAIと議論して最終的に一つの結論に収束させる場に参加しています。
 予想は特定の観点に偏らず、過去の走破内容・騎手・枠順・馬場状態・脚質と想定ペース・近走の勢いを総合的に判断してください。
-出力は指定されたJSON形式のみです。出走データに「市場勝率○%」とある数値は単勝オッズ由来の市場の勝率評価です。各印の理由では、自分の勝率と市場勝率との差（乖離、ポイント）と、その根拠（市場が見落としている情報）を短く述べてください。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は持ち点から賭ける点数で、合計は指示された上限以内にしてください。出走データに「騎手（中央・今季）勝率○% 連対○% 複勝○%」とある数値は、その騎手・調教師の当該主催（中央/地方）での今季成績です（「通算」は今季の記録がない場合の通算成績）。併記がない人物は成績データなしです。騎手の評価は名前の印象ではなく、この数字を根拠にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
+出力は指定されたJSON形式のみです。出走データに「市場勝率○%」とある数値は単勝オッズ由来の市場の勝率評価です。各印の理由では、自分の勝率と市場勝率との差（乖離、ポイント）と、その根拠（市場が見落としている情報）を短く述べてください。印は◎○▲△の4つを、すべて異なる馬番で選んでください。各印には勝率（win_pct、1〜90の整数）と3着内率（top3_pct、勝率以上99以下の整数）の推定を付けてください。4つの勝率の合計は100を超えないでください。買い目の金額は点数で、合計は指示された上限以内にしてください。出走データに「騎手（中央・今季）勝率○% 連対○% 複勝○%」とある数値は、その騎手・調教師の当該主催（中央/地方）での今季成績です（「通算」は今季の記録がない場合の通算成績）。併記がない人物は成績データなしです。騎手の評価は名前の印象ではなく、この数字を根拠にしてください。理由の中でレース名や馬名に触れるときは、入力データの表記（漢字・かなの別を含む）をそのままコピーしてください。
 出力例: {"marks": [{"mark": "◎", "number": 7, "win_pct": 30, "top3_pct": 60, "reason": "近走の内容が安定"}, {"mark": "○", "number": 1, "win_pct": 22, "top3_pct": 50, "reason": "コース適性が高い"}, {"mark": "▲", "number": 11, "win_pct": 15, "top3_pct": 40, "reason": "脚質が展開に合う"}, {"mark": "△", "number": 4, "win_pct": 10, "top3_pct": 30, "reason": "人気薄だが一発がある"}], "bets": [{"type": "単勝", "combo": "7", "amount": 500}, {"type": "3連複", "combo": "1-7-11", "amount": 500}], "comment": "全体のまとめを1〜2文で。"}"""
 
 PREDICTION_SCHEMA = {
@@ -617,8 +617,9 @@ def parse_bet_lines(section: str) -> tuple[list[dict], list[str]]:
 def prediction_errors(text: str, fixture: dict,
                       max_total: int | None = None) -> list[str]:
     """Full validation of a free-text prediction (marks + probabilities
-    + bets). With max_total, bets are points capped by the AI's balance;
-    without it, the legacy fixed total of 1,000 yen applies."""
+    + bets). With max_total, bets are points capped by the flat
+    per-race cap; without it, the legacy fixed total of 1,000 yen
+    applies."""
     marks = parse_marks(text)
     errors = validate_marks(marks, fixture)
     errors += validate_probabilities(parse_probabilities(text), marks)
@@ -721,28 +722,28 @@ def _structured_with_retry(prov, system: str, user: str, schema: dict,
     return obj
 
 
-def budget_line(balance: int | None, cap: int | None) -> str:
+def budget_line(cap: int | None) -> str:
     """The staking instruction appended to a prediction prompt. In
-    points mode the AI stakes from its own balance up to its cap; the
-    legacy wording (no points context) keeps the fixed 1,000-yen rule."""
-    if balance is not None and cap is not None:
+    points mode it states ONLY the flat per-race cap: no balance is
+    ever shown at generation time (decoupled scoreboard, 2026-11-08 —
+    a losing streak must not change how an AI bets or estimates).
+    The legacy wording (no points context) keeps the fixed
+    1,000-yen rule."""
+    if cap is not None:
         return (
-            f"\n\nあなたの現在の持ち点は {balance:,} 点です。買い目の合計は "
-            f"{cap:,} 点以内にし、100点単位で配分してください。"
-            "自信のある買い目ほど厚く張ってください（当たれば実際の配当で"
-            "持ち点が増え、外れれば賭けた分が減ります）。"
+            f"\n\n買い目の合計は {cap:,} 点以内にし、100点単位で配分して"
+            "ください。自信のある買い目ほど厚く張ってください。"
         )
     return "\n\n買い目の合計は必ず1,000円ちょうどにしてください。"
 
 
 def generate_structured_prediction(prov, fixture: dict,
-                                   balance: int | None = None,
                                    cap: int | None = None) -> str:
     body = race_text(fixture, form_limit=3)
     user = (
         f"次のレースの予想をしてください。\n\n{body}"
         + market_prompt_note(fixture)
-        + budget_line(balance, cap)
+        + budget_line(cap)
     )
     obj = _structured_with_retry(
         prov, LOCAL_SYSTEM, user, PREDICTION_SCHEMA,
@@ -1192,12 +1193,14 @@ def _ballot_errors(text: str, fixture: dict) -> tuple[dict, list[str]]:
     return marks, validate_marks(marks, fixture)
 
 
-def _points_view(points: dict | None, built, display_of: dict) -> str:
-    """One-line standings for posts: 'ChatGPT 10,000点 / ...'."""
+def _score_view(points: dict | None, built, display_of: dict) -> str:
+    """One-line scoreboard for posts, as cumulative P&L (累積収支):
+    'ChatGPT +29,430点 / ...'. The raw balance is never displayed."""
     if not points:
         return ""
     parts = [
-        f"{display_of.get(u, u)} {v['balance']:,}点" for u, v in points.items()
+        f"{display_of.get(u, u)} {points_mod.format_score(v['balance'])}点"
+        for u, v in points.items()
     ]
     return " / ".join(parts)
 
@@ -1212,7 +1215,7 @@ class _StageFailure(RuntimeError):
 
 
 def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
-                              balance: int | None, cap: int | None) -> str:
+                              cap: int | None) -> str:
     """One cloud persona's free-text prediction, fully validated, with
     the standard one error-feedback retry. Raises RuntimeError when the
     retry still fails validation."""
@@ -1220,7 +1223,7 @@ def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
     system = SYSTEM_TEMPLATE.format(display=persona["display"])
     user = f"次のレースの予想をしてください。\n\n{body}"
     user += market_prompt_note(fixture)
-    user += budget_line(balance, cap)
+    user += budget_line(cap)
     text = prov.chat(system, user)
     errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
     if errors:
@@ -1751,9 +1754,9 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         display_of = {p["username"]: p["display"] for p, _ in built}
         display_of[MC_USERNAME] = "結論口座"
         opening += (
-            "\n\n【現在の持ち点】\n"
-            + _points_view(points, built, display_of)
-            + "\n（買い目は持ち点から賭けます。当たれば実際の配当で増え、外れれば賭けた分が減ります）"
+            "\n\n【累積収支（戦績）】\n"
+            + _score_view(points, built, display_of)
+            + "\n（買い目は残高によらない一律の上限で賭け、精算結果は累積収支として記録されます）"
         )
     opening += "\n\n" + hashtag_line(fixture)
 
@@ -1795,18 +1798,19 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         if username in cache["predictions"]:
             predictions[username] = cache["predictions"][username]
             continue
-        balance = cap = None
+        # Only the flat cap reaches generation; the balance is a
+        # scoreboard figure and is never an input (decoupled, 2026-11-08).
+        cap = None
         if points and username in points:
-            balance = points[username]["balance"]
             cap = points[username]["cap"]
         try:
             if persona.get("structured") and hasattr(prov, "chat_json"):
                 text = generate_structured_prediction(
-                    prov, fixture, balance=balance, cap=cap
+                    prov, fixture, cap=cap
                 )
             else:
                 text = _generate_text_prediction(
-                    prov, persona, fixture, body, balance, cap
+                    prov, persona, fixture, body, cap
                 )
         except Exception as exc:  # noqa: BLE001 - exclusion, not abort
             _exclude(persona, "prediction", f"{type(exc).__name__}: {exc}")
@@ -1918,9 +1922,9 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         fp = final_probs.get(u) or init_probs.get(u) or {}
         contribs.append({int(n): int(p) for n, p in fp.items()})
     gate = evaluate_conclusion_gate(fixture, contribs)
+    # The conclusion account stakes a flat 1,000 points per race,
+    # never derived from its balance (decoupled, 2026-11-08).
     final_total = 1000
-    if points and MC_USERNAME in points:
-        final_total = min(1000, points[MC_USERNAME]["cap"])
     final_bet = None
     if gate["decision"] != "pass" and final_total > 0 and ranking:
         bet_ranking = ranking
@@ -2049,12 +2053,6 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
             "\n\n【結論口座】見送り（このレースは賭けません）"
             f"\n理由: {gate['reason']}"
         )
-    if points:
-        display_of = {p["username"]: p["display"] for p, _ in built}
-        display_of[MC_USERNAME] = "結論口座"
-        conclusion += (
-            "\n\n【持ち点（予想時点）】\n" + _points_view(points, built, display_of)
-        )
     conclusion += "\n\n結果が出たら回顧します。"
     conclusion += "\n\n" + hashtag_line(fixture)
 
@@ -2114,14 +2112,13 @@ def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
     run resumes instead of duplicating."""
     d = store.data
     if not d.get("texts"):
-        # Points: snapshot every account's balance/cap before generation
-        # (the prompts stake against these numbers), applying the relief
-        # top-up first so no account is priced out of betting entirely.
+        # Points: snapshot every account before generation. Only the
+        # flat cap reaches the prompts; the balances are kept for the
+        # opening note's scoreboard (shown as 累積収支) and the state
+        # audit trail. No relief top-up exists any more (decoupled,
+        # 2026-11-08): a low balance changes nothing about a run.
         ledger = points_mod.PointsLedger(points_mod.ledger_path(emitter.live))
-        race_id = fixture_race_id(fixture) or ""
         usernames = [p["username"] for p, _ in built] + [MC_USERNAME]
-        for u in usernames:
-            ledger.ensure_bettable(u, race_id)
         snap = ledger.snapshot(usernames)
         cache = d.setdefault(
             "gen", {"predictions": {}, "debate": {}, "final_marks": {},
@@ -2222,8 +2219,8 @@ def reflection_user_prompt(
     if rec:
         lines.append("")
         lines.append(
-            f"【持ち点の精算】賭け {rec['staked']:,}点 → 払戻 {rec['returned']:,}点、"
-            f"残高は {rec['balance']:,}点になりました。"
+            f"【精算】賭け {rec['staked']:,}点 → 払戻 {rec['returned']:,}点、"
+            f"累積収支は {points_mod.format_score(rec['balance'])}点になりました。"
         )
     lines.append("")
     lines.append("この結果を受けて、あなたの反省を述べてください。")
@@ -2295,20 +2292,22 @@ def build_review_text(fixture: dict, results: dict, state: dict | None) -> str:
     points_rec = (state.get("review") or {}).get("points")
     if points_rec:
         lines.append("")
-        lines.append("持ち点の精算：")
+        lines.append("精算（累積収支）：")
         for username, rec in points_rec.items():
             profit = rec["returned"] - rec["staked"]
             lines.append(
                 f"  {display_name(username)}: 賭け {rec['staked']:,}点 → "
-                f"払戻 {rec['returned']:,}点（{profit:+,}点）残高 {rec['balance']:,}点"
+                f"払戻 {rec['returned']:,}点（{profit:+,}点）"
+                f"累積収支 {points_mod.format_score(rec['balance'])}点"
             )
         standings = (state.get("review") or {}).get("standings") or {}
         if standings:
             order = sorted(standings.items(), key=lambda kv: -kv[1])
             lines.append(
-                "現在の順位: "
+                "現在の順位（累積収支）: "
                 + " / ".join(
-                    f"{i + 1}位 {display_name(u)} {b:,}点"
+                    f"{i + 1}位 {display_name(u)} "
+                    f"{points_mod.format_score(b)}点"
                     for i, (u, b) in enumerate(order)
                 )
             )

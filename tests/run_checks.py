@@ -413,10 +413,10 @@ del _no_exacta["payouts_jpy"]["exacta"]
 check("settle: winning bet with missing payout data returns None",
       o.bet_return(_b("馬単", [2, 4], 100), monbetsu, _no_exacta) is None)
 
-# --- ledger: init, cap, idempotent settle, relief ---
+# --- ledger: init, flat cap, idempotent settle, negative balances ---
 with tempfile.TemporaryDirectory() as td:
     led = points_mod.PointsLedger(Path(td) / "points.json")
-    check("ledger: initial balance and 30% cap",
+    check("ledger: initial balance and flat cap",
           led.balance("chatgpt") == 10000 and led.cap("chatgpt") == 3000)
     rec = led.settle("r1", "レース1", "chatgpt", 1000, 2500)
     check("ledger: settle moves balance by returned - staked",
@@ -424,13 +424,36 @@ with tempfile.TemporaryDirectory() as td:
     rec2 = led.settle("r1", "レース1", "chatgpt", 1000, 2500)
     check("ledger: settle is idempotent per race+account",
           rec2["balance"] == 11500 and led.balance("chatgpt") == 11500)
+    check("ledger: cap does not grow with a bigger balance",
+          led.cap("chatgpt") == 3000)
     led.settle("r2", "レース2", "claude", 9950, 0)
     check("ledger: balance can fall below the minimum bet",
           led.balance("claude") == 50)
-    check("ledger: relief tops up once per race",
-          led.ensure_bettable("claude", "r3") is True
-          and led.balance("claude") == 1000
-          and led.ensure_bettable("claude", "r3") is False)
+    check("ledger: tiny balance keeps the full flat cap",
+          led.cap("claude") == 3000
+          and o.validate_bets(
+              [{"type": "単勝", "numbers": [1], "amount": 3000}],
+              monbetsu, max_total=led.cap("claude")) == []
+          and o.validate_bets(
+              [{"type": "単勝", "numbers": [1], "amount": 3100}],
+              monbetsu, max_total=led.cap("claude")) != [])
+    rec_neg = led.settle("r2x", "レース2x", "claude", 200, 0)
+    check("ledger: settlement can drive the balance negative, exactly",
+          rec_neg["balance"] == -150 and led.balance("claude") == -150)
+    check("ledger: negative balance still caps flat and scores exactly",
+          led.cap("claude") == 3000 and led.score("claude") == -10150)
+    check("ledger: no relief mechanism remains",
+          not hasattr(led, "ensure_bettable")
+          and all(h.get("kind") != "relief"
+                  for a in led.data["accounts"].values()
+                  for h in a["history"]))
+
+# --- scoreboard formatting (score = balance - 10,000, always signed) ---
+check("score: positive", points_mod.format_score(39430) == "+29,430")
+check("score: negative", points_mod.format_score(620) == "-9,380")
+check("score: zero form", points_mod.format_score(10000) == "±0")
+check("score: small negative", points_mod.format_score(9950) == "-50")
+check("score: score_of", points_mod.score_of(620) == -9380)
 
 # --- settle_race_points end to end ---
 with tempfile.TemporaryDirectory() as td:
@@ -465,10 +488,63 @@ _snap["shikai"] = {"balance": 10000, "cap": 3000}
 _gen_pts = o._generate_prediction_texts(
     monbetsu, o.build_providers(mock=True), points=_snap
 )
-check("gen points: opening and conclusion carry balances and fair odds",
-      "持ち点" in _gen_pts["texts"]["opening"]
+check("gen points: opening carries the scoreboard, conclusion has none",
+      "累積収支" in _gen_pts["texts"]["opening"]
+      and "予想時点" not in _gen_pts["texts"]["conclusion"]
       and "フェアオッズ" in _gen_pts["texts"]["conclusion"]
       and "結論口座" in _gen_pts["texts"]["conclusion"])
+
+# --- decoupling: a sentinel balance reaches NO generation prompt ------
+# (2026-11-08: balances are a pure scoreboard. Generation may only ever
+# see the flat cap; the opening note shows the score, never the raw
+# balance. A sentinel balance of 123,456 must appear nowhere.)
+class _RecordingProvider:
+    """Wraps a provider and records every prompt it is handed."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.prompts: list[str] = []
+
+    def chat(self, system, user, **kw):
+        self.prompts.append(system + "\n" + user)
+        return self._inner.chat(system, user, **kw)
+
+    def chat_json(self, system, user, schema, **kw):
+        self.prompts.append(system + "\n" + user)
+        return self._inner.chat_json(system, user, schema, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+_snap_sentinel = {u: {"balance": 123456, "cap": 3000} for u in _snap}
+_built_rec = [
+    (p, _RecordingProvider(prov)) for p, prov in o.build_providers(mock=True)
+]
+_gen_sentinel = o._generate_prediction_texts(
+    monbetsu, _built_rec, points=_snap_sentinel
+)
+_all_prompts = "\n".join(
+    pr for _p, prov in _built_rec for pr in prov.prompts
+)
+check("decoupled: sentinel balance appears in no generation prompt",
+      "123,456" not in _all_prompts and "123456" not in _all_prompts)
+check("decoupled: generation prompts state the flat cap",
+      "買い目の合計は 3,000 点以内" in _all_prompts)
+_all_texts = "\n".join(
+    [_gen_sentinel["texts"]["opening"], _gen_sentinel["texts"]["conclusion"]]
+    + list(_gen_sentinel["texts"]["predictions"].values())
+    + list(_gen_sentinel["texts"]["debate"].values())
+)
+check("decoupled: posted texts carry no raw balance either",
+      "123,456" not in _all_texts)
+check("decoupled: opening shows the score, labelled 累積収支",
+      "累積収支" in _gen_sentinel["texts"]["opening"]
+      and "+113,456" in _gen_sentinel["texts"]["opening"])
+check("decoupled: conclusion carries no points view",
+      "予想時点" not in _gen_sentinel["texts"]["conclusion"])
+check("decoupled: budget line states only the flat cap",
+      "3,000" in o.budget_line(3000))
 
 # --- Exclusion + bet reconciliation (2026-11-05 user decisions) ---------
 # (1) An AI that fails validation twice is excluded and the rest of the
