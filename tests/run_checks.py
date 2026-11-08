@@ -536,6 +536,48 @@ with tempfile.TemporaryDirectory() as td:
           "badai" not in _recs_a
           and set(_recs_a) == {"chatgpt", "claude", "gemini", "shikai"})
 
+# (a2) an AI excluded AFTER its prediction was posted (debate/ballot
+# stage) still has a saved prediction text and initial bets — settlement
+# must skip it anyway and leave its balance untouched (2026-11-08 Saga
+# bug: @local, excluded at the debate stage, was settled for 3,100).
+with tempfile.TemporaryDirectory() as td:
+    _led_a2 = points_mod.PointsLedger(Path(td) / "points.json")
+    _state_a2 = {
+        "race": "第1回 2歳 未勝利",
+        "race_id": monbetsu["race"]["race_id"],
+        "texts": {"predictions": {"chatgpt": text_ok, "claude": text_ok}},
+        "excluded": [
+            {"username": "chatgpt", "stage": "debate",
+             "reason": "empty output"},
+        ],
+    }
+    _recs_a2 = o.settle_race_points(
+        monbetsu, synth_results, _state_a2, _led_a2)
+    check("exclusion: debate-stage exclusion is skipped by settlement",
+          "chatgpt" not in _recs_a2 and "claude" in _recs_a2
+          and _led_a2.balance("chatgpt") == 10000)
+    # same when the excluded AI even has reconciled final bets recorded
+    _state_a2b = dict(_state_a2)
+    _state_a2b["final_bets"] = {
+        "chatgpt": [{"type": "単勝", "numbers": [2], "amount": 500}],
+    }
+    _state_a2b["excluded"] = [
+        {"username": "chatgpt", "stage": "ballot", "reason": "no ballot"},
+    ]
+    _recs_a2b = o.settle_race_points(
+        monbetsu, synth_results, _state_a2b, _led_a2)
+    check("exclusion: ballot-stage exclusion is skipped even with final bets",
+          "chatgpt" not in _recs_a2b
+          and _led_a2.balance("chatgpt") == 10000)
+    # ledger corrections: auditable and idempotent per race+account
+    _adj = _led_a2.adjust("rX", "補正レース", "chatgpt", 3100,
+                          "test correction")
+    _adj2 = _led_a2.adjust("rX", "補正レース", "chatgpt", 3100,
+                           "test correction")
+    check("ledger: adjust credits once and is idempotent",
+          _adj["balance"] == 13100 and _adj2["balance"] == 13100
+          and _led_a2.balance("chatgpt") == 13100)
+
 # (c) exclusions that leave fewer than two AIs abort the run
 try:
     o._generate_prediction_texts(

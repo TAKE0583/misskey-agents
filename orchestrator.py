@@ -2392,17 +2392,28 @@ def settle_race_points(fixture: dict, results: dict, state: dict,
                        ledger: "points_mod.PointsLedger") -> dict:
     """Settle every saved bet of this race against the real payouts.
     Returns {username: settlement record}. Raises RuntimeError when a
-    winning bet cannot be priced from the results fixture."""
+    winning bet cannot be priced from the results fixture. AIs listed
+    in state["excluded"] are never settled, at any exclusion stage."""
     race_id = fixture_race_id(fixture) or state.get("race_id") or ""
     race_name = state.get("race") or ""
     records: dict[str, dict] = {}
     texts = (state.get("texts") or {}).get("predictions") or {}
+    # An AI excluded at ANY stage is out of settlement for this race,
+    # even when it still has a saved prediction text: debate/ballot
+    # exclusions happen after the prediction was posted, so the initial
+    # bets exist but must never be settled (2026-11-08 Saga bug: @local,
+    # excluded at the debate stage, lost 3,100 points this way).
+    # Prediction-stage exclusions have no text and are skipped either
+    # way; this guard is what covers the later stages.
+    excluded = {e.get("username") for e in (state.get("excluded") or [])}
     # The reconciled bets (state["final_bets"]) are authoritative: they
     # are the slips consistent with each AI's final marks. States saved
     # before reconciliation existed fall back to parsing the prediction
     # text, as before.
     final_bets_map = state.get("final_bets") or {}
     for username, text in texts.items():
+        if username in excluded:
+            continue  # excluded at some stage: no bets, no settlement
         if username in final_bets_map:
             bets = [
                 {

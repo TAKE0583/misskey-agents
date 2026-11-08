@@ -103,3 +103,31 @@ class PointsLedger:
         self.data["settled"][key] = rec
         self.save()
         return rec
+
+    def adjust(self, race_id: str, race_name: str, username: str,
+               amount: int, reason: str) -> dict:
+        """Apply a one-off auditable balance correction (for example
+        undoing a settlement that should never have happened).
+        Idempotent per (race, account): repeating the same correction
+        returns the existing record and never moves the balance twice.
+        The original history entries stay untouched; the correction is
+        its own history entry, so the audit trail shows both."""
+        corrections = self.data.setdefault("corrections", {})
+        key = f"{race_id}:{username}"
+        if key in corrections:
+            return corrections[key]
+        acct = self._account(username)
+        acct["balance"] = int(acct["balance"]) + int(amount)
+        rec = {
+            "race_id": race_id,
+            "race": race_name,
+            "username": username,
+            "amount": int(amount),
+            "reason": reason,
+            "balance": int(acct["balance"]),
+            "at": _now(),
+        }
+        acct["history"].append({"kind": "adjust", **rec})
+        corrections[key] = rec
+        self.save()
+        return rec
