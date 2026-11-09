@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import sys
 import time
@@ -440,6 +441,182 @@ class PersonStatsCache:
         self.dirty = False
 
 
+def _id_str(value) -> str | None:
+    """Normalize an ID cell from a vendor DataFrame (may arrive as
+    float, int, or str) to a plain string, or None when absent."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s or None
+
+
+# --- Horse career cache (racing DB layer 1, 2026-11-10) ----------------
+# db.netkeiba's per-horse results page carries the full career with
+# the detail the shutuba_past form strings lack (margin, passing
+# order, final 3F, horse weight). Parsed rows feed racing_db, which
+# build_fixture then queries for detailed recent form.
+
+_CAREER_RACE_LINK = re.compile(r"/race/(\d{8,})/?$")
+_CAREER_JOCKEY_LINK = re.compile(r"/jockey/result/recent/(\w+)/")
+_CAREER_GRADE = re.compile(r"\((G[123]|G[ⅠⅡⅢ]|Jpn[123]|J\.G[123])\)\s*$")
+
+
+def _num(value: str, kind=float):
+    try:
+        return kind(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_horse_career(html: str) -> list[dict]:
+    """Parse db.netkeiba's db_h_race_results table into normalized
+    row dicts for racing_db.ingest_career(). Unparseable rows are
+    skipped; premium-masked index columns are ignored entirely."""
+    soup = BeautifulSoup(html, "html.parser")
+    tbl = soup.find("table", class_="db_h_race_results")
+    if tbl is None:
+        return []
+    rows: list[dict] = []
+    for tr in tbl.find_all("tr")[1:]:
+        cells = tr.find_all(["td", "th"])
+        if len(cells) < 30:
+            continue
+        t = [c.get_text(strip=True) for c in cells]
+        race_id = None
+        jockey_id = None
+        for a in tr.find_all("a"):
+            href = a.get("href") or ""
+            m = _CAREER_RACE_LINK.search(href)
+            if m and race_id is None:
+                race_id = m.group(1)
+            m = _CAREER_JOCKEY_LINK.search(href)
+            if m and jockey_id is None:
+                jockey_id = m.group(1)
+        if race_id is None:
+            continue
+        date_m = re.match(r"(\d{4})/(\d{2})/(\d{2})", t[0])
+        if not date_m:
+            continue
+        venue = re.sub(r"\d+$", "", re.sub(r"^\d+", "", t[1]))
+        dist_m = re.match(r"([^\d]+)(\d+)", t[14])
+        pos_raw = t[11]
+        position = int(pos_raw) if pos_raw.isdigit() else None
+        status = None if position is not None else (pos_raw or None)
+        weight_m = re.match(r"(\d+)\(([+-]?\d+)\)", t[28])
+        grade_m = _CAREER_GRADE.search(t[4])
+        passing = t[25] if re.fullmatch(r"[\d\-]+", t[25] or "") else None
+        rows.append({
+            "race_id": race_id,
+            "date": f"{date_m.group(1)}-{date_m.group(2)}-{date_m.group(3)}",
+            "venue": venue,
+            "weather": t[2] or None,
+            "race_number": _num(t[3], int),
+            "race_name": t[4],
+            "grade": grade_m.group(1) if grade_m else None,
+            "field_size": _num(t[6], int),
+            "bracket": _num(t[7], int),
+            "number": _num(t[8], int),
+            "win_odds": _num(t[9]),
+            "popularity": _num(t[10], int),
+            "position": position,
+            "status": status,
+            "jockey": t[12] or None,
+            "jockey_id": jockey_id,
+            "weight_kg": _num(t[13]),
+            "surface": dist_m.group(1) if dist_m else None,
+            "distance_m": _num(dist_m.group(2), int) if dist_m else None,
+            "going": t[16] or None,
+            "time": t[18] or None,
+            "margin": t[19] or None,
+            "passing": passing,
+            "final_3f": _num(t[27]),
+            "horse_weight": int(weight_m.group(1)) if weight_m else None,
+            "horse_weight_diff": (
+                int(weight_m.group(2)) if weight_m else None
+            ),
+            "jurisdiction": (
+                "JRA" if len(race_id) == 12 and race_id[4:6] <= "10"
+                else "NAR"
+            ),
+        })
+    return rows
+
+
+def fetch_horse_career(horse_id: str) -> list[dict] | None:
+    """Fetch + parse one horse's career page. Best-effort like the
+    odds snapshot: any failure returns None and the caller degrades
+    to the legacy form strings for that horse."""
+    url = f"{DB_URL}/horse/result/{horse_id}/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001 - career data is optional input
+        return None
+    time.sleep(0.3)  # keep fetches polite, as with profile pages
+    text = resp.content.decode("euc-jp", errors="replace")
+    if "db_h_race_results" not in text:
+        alt = resp.content.decode("utf-8", errors="replace")
+        if "db_h_race_results" in alt:
+            text = alt
+    return parse_horse_career(text)
+
+
+def _db_form_for_horses(race: dict, horses: list[dict]) -> dict[int, list[str]]:
+    """Detailed recent form from the local racing DB, keyed by horse
+    number. Ensures each horse's career is cached (at most one fetch
+    per horse per day), then renders the last five runs before this
+    race. Any failure returns {} so the caller keeps the legacy
+    shutuba_past strings. RACING_DB_DISABLE=1 turns the layer off;
+    RACING_DB_READONLY=1 queries without fetching (archive builds).
+    """
+    if os.environ.get("RACING_DB_DISABLE"):
+        return {}
+    try:
+        import racing_db
+
+        conn = racing_db.connect()
+    except Exception:  # noqa: BLE001 - the DB layer is optional
+        return {}
+    readonly = bool(os.environ.get("RACING_DB_READONLY"))
+    out: dict[int, list[str]] = {}
+    race_date = str(race.get("date") or "")
+    for h in horses:
+        horse_id = h.get("horse_id")
+        if not horse_id:
+            continue
+        try:
+            if not readonly and not racing_db.career_fetched_today(
+                conn, horse_id
+            ):
+                rows = fetch_horse_career(horse_id)
+                if rows is not None:
+                    racing_db.ingest_career(
+                        conn, horse_id, h.get("name"), rows
+                    )
+            runs = racing_db.recent_runs(
+                conn, horse_id, race_date, limit=5,
+                exclude_race_id=race.get("race_id"),
+            )
+            if runs:
+                out[h["number"]] = [
+                    racing_db.format_form_run(r) for r in runs
+                ]
+        except Exception as exc:  # noqa: BLE001 - per-horse degradation
+            print(
+                f"[racing-db] form failed for {horse_id}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+    return out
+
+
 def nar_race_info(soup: BeautifulSoup, race_id: str, field_size: int) -> dict:
     """Extract the same info dict shape as EntryPageScraper.get_race_info
     from a nar.netkeiba.com shutuba page, whose markup differs from JRA's."""
@@ -556,6 +733,7 @@ def build_fixture(
         horses.append({
             "bracket": int(row["枠"]),
             "number": number,
+            "horse_id": _id_str(row.get("馬ID")),
             "name": row["馬名"],
             "sex_age": f"{row['性別']}{int(row['年齢'])}",
             "weight_kg": float(row["斤量"]),
@@ -577,7 +755,39 @@ def build_fixture(
             },
         })
     stats_cache.save()
-    return {"race": race, "horses": horses}
+    # Detailed recent form from the racing DB, when available, wins
+    # over the legacy shutuba_past strings (per horse; the fixture
+    # records which source served the field for later comparison).
+    db_form = _db_form_for_horses(race, horses)
+    if db_form:
+        for h in horses:
+            if h["number"] in db_form:
+                h["recent_form"] = db_form[h["number"]]
+    if not db_form:
+        form_source = "legacy"
+    elif len(db_form) == len(horses):
+        form_source = "db"
+    else:
+        form_source = "mixed"
+    return {"race": race, "horses": horses, "form_source": form_source}
+
+
+def _nar_cell(row, *names):
+    for n in names:
+        if n in row and not pd.isna(row[n]):
+            return row[n]
+    return None
+
+
+def _weight_pair(value) -> tuple[int | None, int | None]:
+    """'480(+2)' / '480（+2）' / 480 -> (weight, diff)."""
+    if value is None:
+        return None, None
+    m = re.search(r"(\d{3})\s*[(（]\s*([+-]?\d+)\s*[)）]", str(value))
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"(\d{3})", str(value))
+    return (int(m.group(1)), None) if m else (None, None)
 
 
 def nar_finish(race_id: str) -> list[dict]:
@@ -595,6 +805,17 @@ def nar_finish(race_id: str) -> list[dict]:
         if pd.isna(pos):
             continue  # 競走中止・除外など
         margin = row.get("着差")
+        bracket = _nar_cell(row, "枠番", "枠")
+        final_3f = _nar_cell(row, "後3F", "上り3F", "上がり3F")
+        passing = _nar_cell(
+            row, "通過", "通過順", "通過順位", "コーナー通過順"
+        )
+        weight_col = next(
+            (c for c in row.index if str(c).startswith("馬体重")), None
+        )
+        weight, weight_diff = _weight_pair(
+            row[weight_col] if weight_col else None
+        )
         finish.append({
             "position": int(pos),
             "number": int(row["馬番"]),
@@ -603,6 +824,13 @@ def nar_finish(race_id: str) -> list[dict]:
             "time": row["タイム"],
             "margin": "" if pd.isna(margin) else str(margin),
             "win_odds": float(row["単勝オッズ"]),
+            # Detail for the racing DB (2026-11-10); absent columns
+            # on the NAR table simply stay None.
+            "bracket": int(bracket) if bracket is not None else None,
+            "final_3f": float(final_3f) if final_3f is not None else None,
+            "passing": str(passing) if passing is not None else None,
+            "horse_weight": weight,
+            "horse_weight_diff": weight_diff,
         })
     return sorted(finish, key=lambda f: f["position"])
 
@@ -656,6 +884,23 @@ def parse_payouts(soup: BeautifulSoup) -> dict:
     return payouts
 
 
+def _passing_str(row) -> str | None:
+    """'5-5-4' from the vendor frame's per-corner position columns."""
+    parts = []
+    for corner in (
+        "1コーナー通過順", "2コーナー通過順",
+        "3コーナー通過順", "4コーナー通過順",
+    ):
+        v = row.get(corner)
+        if v is None or pd.isna(v):
+            continue
+        try:
+            parts.append(str(int(float(v))))
+        except (TypeError, ValueError):
+            continue
+    return "-".join(parts) if parts else None
+
+
 def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
     if nar:
         cfg = ScrapingConfig(netkeiba_race_url=NAR_RACE_URL)
@@ -679,6 +924,34 @@ def build_results(race_id: str, fixture: dict, nar: bool = False) -> dict:
                 "time": row["タイム"],
                 "margin": "" if pd.isna(margin) else str(margin),
                 "win_odds": float(row["単勝オッズ"]),
+                "jockey": row["騎手"],
+                "trainer": row["厩舎"],
+                "sex_age": f"{row['性別']}{int(row['年齢'])}",
+                "weight_kg": float(row["斤量"]),
+                # Detail for the racing DB (2026-11-10): the vendor
+                # frame already carries these; they used to be dropped.
+                "bracket": (
+                    int(row["枠"]) if not pd.isna(row.get("枠")) else None
+                ),
+                "horse_id": _id_str(row.get("馬ID")),
+                "status": (
+                    str(row["異常区分"]).strip() or None
+                    if row.get("異常区分") is not None
+                    and not pd.isna(row.get("異常区分")) else None
+                ),
+                "final_3f": (
+                    float(row["後3F"])
+                    if not pd.isna(row.get("後3F")) else None
+                ),
+                "passing": _passing_str(row),
+                "horse_weight": (
+                    int(row["馬体重"])
+                    if not pd.isna(row.get("馬体重")) else None
+                ),
+                "horse_weight_diff": (
+                    int(row["増減"])
+                    if not pd.isna(row.get("増減")) else None
+                ),
             })
     payouts = parse_payouts(scraper.soup)
     if "win" not in payouts or "trio" not in payouts:

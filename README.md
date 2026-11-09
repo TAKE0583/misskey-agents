@@ -450,3 +450,29 @@ python3 tests/run_checks.py
   実装（前々節）。再現ケースを `tests/run_checks.py` に追加済み
   （全121チェック。うちオッズAPI/de-vig の4件は venv の python
   でのみ実行され、system python では SKIP 表示になる）。
+
+## レーシングDB（2026-11-10 追加、レビュー項目#2「フィクスチャ充実」）
+
+設計書は goal files の `data-db-design-20261109.html`。単一ファイル
+SQLite `data/racing.db`（`racing_db.py`、WAL、upsert 冪等）。
+
+- **第1層・馬キャッシュ**: `build_fixture.py` が出馬表の馬ID
+  （`horse_id`、vendor 出馬表の馬ID列）を fixture に載せ、
+  db.netkeiba の全成績ページ（`/horse/result/<id>/`）を馬ごと
+  1日1回まで取得して DB に取り込む。近走は DB から
+  「着差・通過・上がり3F・馬体重」を含む詳細形式で描画される。
+  DB が使えない/成績が無い馬は従来の shutuba_past 文字列に劣化し、
+  fixture の `form_source` に `db` / `mixed` / `legacy` を記録する
+  （切り替え前後の log-loss 比較用）。`RACING_DB_DISABLE=1` で無効化、
+  `RACING_DB_READONLY=1` で取得なし照会のみ。
+- **第2層・結果アーカイブ**: `archive_results.py` が毎晩、当日分
+  （JRA 全レース＋NAR 各場メイン）を結果ごと DB に蓄積する
+  （`--days N` で過去分の穴埋めも冪等に再実行できる）。
+  cron `racing-db-nightly-archive`（毎日 21:38 目安）が
+  `--days 3` で回し、失敗があるときだけ報告する。
+- 結果 fixture の finish 行にも詳細列（枠・馬ID・異常区分・後3F・
+  コーナー通過順・馬体重・増減）を保持するよう拡張した
+  （従来は捨てていた vendor 列）。古い fixture は詳細 NULL で
+  取り込まれる。
+- テスト: `tests/run_db_checks.py`（キャリア解析・取り込み・
+  冪等性・COALESCE マージ・重複排除）。
