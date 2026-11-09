@@ -259,17 +259,31 @@ def person_stats_text(horse: dict) -> str:
 
 def race_text(fixture: dict, form_limit: int | None = None) -> str:
     r = fixture["race"]
+    # Bracket and weather have always been in the fixture but were not
+    # rendered into the prompt until 2026-11-10 (the prompts ask the
+    # AIs to weigh 枠順, so the data has to actually reach them). The
+    # .get guards keep older fixtures rendering as before.
+    header = (
+        f"{r['date']} {r['venue']} {r['race_number']}R / {r['course']} "
+        f"{r['distance_m']}m / 馬場：{r['going']}"
+    )
+    weather = str(r.get("weather") or "").strip()
+    if weather:
+        header += f" / 天候：{weather}"
+    header += f" / {r['conditions']} / {r['field_size']}頭立て"
     lines = [
         f"第{r['edition']}回 {r['name']}（{r['grade']}）",
-        f"{r['date']} {r['venue']} {r['race_number']}R / {r['course']} {r['distance_m']}m / 馬場：{r['going']} / {r['conditions']} / {r['field_size']}頭立て",
+        header,
         "",
         "【出走馬】",
     ]
     for h in fixture["horses"]:
         recent = h["recent_form"][:form_limit] if form_limit else h["recent_form"]
         form = " / ".join(recent)
+        bracket = h.get("bracket")
+        bracket_part = f"{bracket}枠・" if bracket else ""
         line = (
-            f"{h['number']} {h['name']}（{h['sex_age']}・{h['weight_kg']}kg・{h['jockey']}・{h['trainer']}厩舎）近走：{form}"
+            f"{h['number']} {h['name']}（{bracket_part}{h['sex_age']}・{h['weight_kg']}kg・{h['jockey']}・{h['trainer']}厩舎）近走：{form}"
         )
         mkt = h.get("market") or {}
         if mkt.get("win_prob") is not None:
@@ -1635,9 +1649,15 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
       "bet"     — the anchor's aggregate win probability reaches
                   market × EDGE_MARGIN; bet, anchored on `anchor`.
       "pass"    — 見送り: no clear edge over the market; stake 0.
-      "ungated" — the fixture has no market data, so no gate can be
-                  applied; the caller bets as before and this record
-                  says why (data-missing is recorded, never hidden).
+                  A fixture with no market data at all also lands
+                  here (flagged via market_missing): beating the
+                  market is the bet's premise, and without a market
+                  snapshot that premise cannot be verified, so the
+                  conclusion account stands down (user decision
+                  2026-11-10, applied uniformly — including fixtures
+                  built before betting opens, e.g. a Thursday-built
+                  G1). "No data" stays distinguishable from "no edge"
+                  via the market_missing flag.
     The anchor is the aggregate's top horse among those whose market
     probability is at least LONGSHOT_MIN_MARKET_PROB: a horse the
     market prices under that floor may top the panel's ranking but
@@ -1649,6 +1669,7 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
     record: dict = {
         "edge_margin": EDGE_MARGIN,
         "longshot_min_market_prob": LONGSHOT_MIN_MARKET_PROB,
+        "market_missing": not market,
         "aggregate_probs": {
             str(n): round(p, 2) for n, p in sorted(vector.items())
         },
@@ -1656,9 +1677,9 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
     }
     if not market:
         record.update({
-            "decision": "ungated",
+            "decision": "pass",
             "anchor": None,
-            "reason": "市場データがないためゲート未適用",
+            "reason": "市場データがないため、市場を上回ることを検証できず見送り",
         })
         return record
     order = sorted(vector.items(), key=lambda kv: (-kv[1], kv[0]))

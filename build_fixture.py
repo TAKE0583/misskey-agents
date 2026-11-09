@@ -521,8 +521,9 @@ def build_fixture(
     if stats_cache is None:
         stats_cache = PersonStatsCache(STATS_CACHE_PATH)
     # Market snapshot: current win odds -> de-vigged win probabilities.
-    # Legitimately empty before betting opens; the nulls then degrade
-    # every downstream consumer to the pre-market behaviour.
+    # Legitimately empty before betting opens; consumers then run
+    # without market figures, and the conclusion gate treats the
+    # missing market as a pass (user decision 2026-11-10).
     win_odds = fetch_win_odds(race_id, nar=nar)
     market_probs = devig_win_probs(win_odds)
     snapshot_time = (

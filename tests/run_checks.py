@@ -89,6 +89,8 @@ for n in (5, 8, 12, 16, 18):
     check(f"mock: 4 distinct picks at n={n}", len({p[0] for p in picks}) == 4)
 mock = providers.MockProvider("ChatGPT")
 body = o.race_text(monbetsu)
+check("race_text: bracket and weather reach the prompt",
+      "1枠" in body and "天候：晴" in body)
 pred = mock.chat("sys", f"次のレースの予想をしてください。\n\n{body}")
 check("mock: prediction validates", o.prediction_errors(pred, monbetsu) == [],
       str(o.prediction_errors(pred, monbetsu)))
@@ -1056,11 +1058,14 @@ check("gate: longshot top is skipped, next eligible horse anchors the bet",
       and _gen_long["conclusion_ranking"][0]["number"] == 3
       and _gen_long["final_bet"].startswith("単勝 10"))
 
-# gate -> ungated: the plain Monbetsu fixture has no market data
+# gate -> no market data: the conclusion account stands down (pass),
+# because beating the market cannot be verified without a market
+# snapshot (user decision 2026-11-10, uniform incl. early-built races)
 _gen_nomkt = o._generate_prediction_texts(monbetsu, o.build_providers(mock=True))
-check("gate: missing market data bets ungated and records it",
-      _gen_nomkt["conclusion_gate"]["decision"] == "ungated"
-      and _gen_nomkt["final_bet"] is not None
+check("gate: missing market data passes and flags market_missing",
+      _gen_nomkt["conclusion_gate"]["decision"] == "pass"
+      and _gen_nomkt["conclusion_gate"]["market_missing"] is True
+      and _gen_nomkt["final_bet"] is None
       and _gen_nomkt["market_ballot"] is None)
 
 # --- A/B scoring ---
@@ -1252,9 +1257,9 @@ with tempfile.TemporaryDirectory() as td:
         o.run_prediction(
             monbetsu, o.Emitter(live=False), _built_e2e, _store_e2e
         )
-        check("e2e: mock prediction completes (ungated, no market data)",
+        check("e2e: mock prediction completes (no market data -> pass)",
               _store_e2e.data["stage"] == "complete"
-              and _store_e2e.data["conclusion_gate"]["decision"] == "ungated")
+              and _store_e2e.data["conclusion_gate"]["decision"] == "pass")
         o.run_review(
             monbetsu, synth_results, _store_e2e,
             o.Emitter(live=False), built=_built_e2e,
