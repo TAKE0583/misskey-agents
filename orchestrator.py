@@ -68,7 +68,7 @@ MARK_SCORE = {"◎": 4, "○": 3, "▲": 2, "△": 1}
 # effective models are recorded in the run state.
 TOP_GRADE_MODELS = {
     "chatgpt": "gpt-6-astra",      # OpenAI flagship ($10/$50 per MTok)
-    "claude": "claude-fable-5-1",  # Anthropic flagship ($10/$50 per MTok)
+    "claude": "claude-fable-5-2",  # Anthropic flagship ($8/$40 per MTok; 5.2 since 2026-11-10, user decision)
 }
 _TOP_GRADE_KEYS = {"G1", "JPN1", "JG1"}  # JG1: jump G1 (Nakayama Grand Jump)
 _GRADE_TRANSLATE = str.maketrans({"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3"})
