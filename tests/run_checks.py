@@ -878,13 +878,13 @@ check("top grade: lesser grades do not qualify",
       and not o.is_top_grade({"race": {}}))
 _built_top = [(p, p["provider"]()) for p in o.PERSONAS]
 _eff_top = o.apply_top_grade_models(jbc, _built_top)
-check("top grade: flagship models applied to chatgpt/claude only",
+check("top grade: flagship models applied to chatgpt/claude/gemini",
       _eff_top == {"chatgpt": "gpt-6-astra",
                    "claude": "claude-fable-5-2",
-                   "gemini": "gemini-3.1-pro-preview"}
+                   "gemini": "gemini-4-argon"}
       and _built_top[0][1].model == "gpt-6-astra"
       and _built_top[1][1].model == "claude-fable-5-2"
-      and _built_top[2][1].model == "gemini-3.1-pro-preview")
+      and _built_top[2][1].model == "gemini-4-argon")
 _built_norm = [(p, p["provider"]()) for p in o.PERSONAS]
 _eff_norm = o.apply_top_grade_models({"race": {"grade": "G2"}}, _built_norm)
 check("top grade: ordinary grades keep the default models",
@@ -1540,12 +1540,12 @@ def _stub_built():
 
 _top_built = _stub_built()
 _eff = o.apply_top_grade_models({"race": {"grade": "JpnI"}}, _top_built)
-check("top grade: chatgpt/claude swap to flagships, gemini untouched",
+check("top grade: chatgpt/claude/gemini swap to flagships",
       _eff == {"chatgpt": "gpt-6-astra", "claude": "claude-fable-5-2",
-               "gemini": "gemini-3.1-pro-preview"}
+               "gemini": "gemini-4-argon"}
       and _top_built[0][1].model == "gpt-6-astra"
       and _top_built[1][1].model == "claude-fable-5-2"
-      and _top_built[2][1].model is None)
+      and _top_built[2][1].model == "gemini-4-argon")
 _norm_built = _stub_built()
 _eff = o.apply_top_grade_models({"race": {"grade": "G2"}}, _norm_built)
 check("normal grade: models stay at the everyday defaults",

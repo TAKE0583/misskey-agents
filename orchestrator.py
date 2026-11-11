@@ -89,6 +89,7 @@ MARK_SCORE = {"◎": 4, "○": 3, "▲": 2, "△": 1}
 TOP_GRADE_MODELS = {
     "chatgpt": "gpt-6-astra",      # OpenAI flagship ($10/$50 per MTok)
     "claude": "claude-fable-5-2",  # Anthropic flagship ($8/$40 per MTok; 5.2 since 2026-11-10, user decision)
+    "gemini": "gemini-4-argon",    # Google flagship ($2/$10 per MTok at introductory pricing through 2026-11-30, doubles 2026-12-01; user decision 2026-11-11, access + format verified live the same day)
 }
 _TOP_GRADE_KEYS = {"G1", "JPN1", "JG1"}  # JG1: jump G1 (Nakayama Grand Jump)
 _GRADE_TRANSLATE = str.maketrans({"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3"})
@@ -340,7 +341,7 @@ def apply_top_grade_models(fixture: dict, built, *, live: bool = False,
                            info_out: dict | None = None) -> dict:
     """Resolve every persona's effective model for this run.
 
-    Top-grade races swap @chatgpt/@claude to their flagships. For other
+    Top-grade races swap @chatgpt/@claude/@gemini to their flagships. For other
     live races, @chatgpt's model comes from the pool allocation (see
     the block comment above). `recorded` — the prediction state's saved
     models, passed on review runs — wins over every rule, so reflections

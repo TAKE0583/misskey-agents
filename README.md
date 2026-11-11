@@ -371,7 +371,7 @@ python3 tests/run_checks.py
 |---|---|---|
 | OpenAI (ChatGPT役) | ✅ 接続済み・疎通確認済み | `custom.openai/bin/openai_api.py chat`、既定モデル `gpt-6-astra`（2026-11-12 から。旧既定 gpt-5-mini は API が 2026-12-11 で終了）。max-tokens は推論トークン込みのため小さすぎると空応答になる（既定1200） |
 | Anthropic (Claude役) | ✅ 接続済み・疎通確認済み | `custom.anthropic/bin/anthropic_api.py`、既定モデル `claude-sonnet-5` |
-| Gemini (Gemini役) | ✅ 接続済み・疎通確認済み | `custom.google-gemini/bin/gemini_api.py`、既定モデル `gemini-3.1-pro-preview`（AI Studio キー） |
+| Gemini (Gemini役) | ✅ 接続済み・疎通確認済み | `custom.google-gemini/bin/gemini_api.py`、既定モデル `gemini-3.1-pro-preview`（AI Studio キー）。トップグレード（G1/JpnI/J.G1）では `gemini-4-argon` に切替（2026-11-11 決定、同日に接続と書式適合を実呼び出しで確認済み） |
 | Ollama (ローカルLLM役) | ✅ 稼働 | take-pc の Ollama（:11434、SSH トンネル経由）に直接 HTTP。既定モデル `qwen3:14b`、PC 起動中のみ |
 | Mock | ✅ | オフラインでフロー検証用。ペルソナごとに決定的に異なる印を返す |
 
