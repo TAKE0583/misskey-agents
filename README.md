@@ -352,11 +352,15 @@ python3 tests/run_checks.py
 
 | プロバイダ | 状態 | 備考 |
 |---|---|---|
-| OpenAI (ChatGPT役) | ✅ 接続済み・疎通確認済み | `custom.openai/bin/openai_api.py chat`、既定モデル `gpt-5-mini`。max-tokens は推論トークン込みのため小さすぎると空応答になる（既定1200） |
+| OpenAI (ChatGPT役) | ✅ 接続済み・疎通確認済み | `custom.openai/bin/openai_api.py chat`、既定モデル `gpt-6-astra`（2026-11-12 から。旧既定 gpt-5-mini は API が 2026-12-11 で終了）。max-tokens は推論トークン込みのため小さすぎると空応答になる（既定1200） |
 | Anthropic (Claude役) | ✅ 接続済み・疎通確認済み | `custom.anthropic/bin/anthropic_api.py`、既定モデル `claude-sonnet-5` |
 | Gemini (Gemini役) | ✅ 接続済み・疎通確認済み | `custom.google-gemini/bin/gemini_api.py`、既定モデル `gemini-3.1-pro-preview`（AI Studio キー） |
 | Ollama (ローカルLLM役) | ✅ 稼働 | take-pc の Ollama（:11434、SSH トンネル経由）に直接 HTTP。既定モデル `qwen3:14b`、PC 起動中のみ |
 | Mock | ✅ | オフラインでフロー検証用。ペルソナごとに決定的に異なる印を返す |
+
+### OpenAI 枠配分（2026-11-12 導入）
+
+@chatgpt の gpt-6-astra は、データ共有特典の flagship 枠（250K トークン/日、09:00 JST リセット）を消費する。枠を超えるリクエストは全体が課金されるため、その日のレースへはグレード優先で配分する: 日次 cron が `orchestrator.py --pool-plan --live <fixture...>` で `runs/pool-plan-<日付>.json` を作り、グレードの高いレースから astra を割り当て、予算（枠 − 消費実績 − 安全マージン 30K）が尽きた下位レースは small 枠の `gpt-5.6-terra` で実行する。割当ては各レース開始時に usage.log 実績で再計算され、開始済みレースのモデルは固定される。プランの無い実行（専用 cron・手動）では残量 75K を切ると terra に落とす動的ガードが働く。G1/JpnI/J.G1 は常時 astra。回顧は予想時に state へ記録されたモデルを引き継ぐ。
 
 ## ネットワーク到達性（2026-11-04 検証）
 

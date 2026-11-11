@@ -888,10 +888,10 @@ check("top grade: flagship models applied to chatgpt/claude only",
 _built_norm = [(p, p["provider"]()) for p in o.PERSONAS]
 _eff_norm = o.apply_top_grade_models({"race": {"grade": "G2"}}, _built_norm)
 check("top grade: ordinary grades keep the default models",
-      _eff_norm == {"chatgpt": "gpt-5-mini",
+      _eff_norm == {"chatgpt": "gpt-6-astra",
                     "claude": "claude-sonnet-5",
                     "gemini": "gemini-3.1-pro-preview"}
-      and _built_norm[0][1].model == "gpt-5-mini")
+      and _built_norm[0][1].model == "gpt-6-astra")
 
 import copy as _copy
 
@@ -1535,7 +1535,7 @@ class _StubProv:
 def _stub_built():
     return [(p, _StubProv(d)) for p, d in zip(
         o.PERSONAS,
-        ["gpt-5-mini", "claude-sonnet-5", "gemini-3.1-pro-preview"])]
+        ["gpt-6-astra", "claude-sonnet-5", "gemini-3.1-pro-preview"])]
 
 
 _top_built = _stub_built()
@@ -1549,9 +1549,112 @@ check("top grade: chatgpt/claude swap to flagships, gemini untouched",
 _norm_built = _stub_built()
 _eff = o.apply_top_grade_models({"race": {"grade": "G2"}}, _norm_built)
 check("normal grade: models stay at the everyday defaults",
-      _eff == {"chatgpt": "gpt-5-mini", "claude": "claude-sonnet-5",
+      _eff == {"chatgpt": "gpt-6-astra", "claude": "claude-sonnet-5",
                "gemini": "gemini-3.1-pro-preview"}
       and all(p.model is None for _, p in _norm_built))
+
+# --- OpenAI pool allocation (2026-11-11) ----------------------------------
+# The flagship pool (250K/day, resets 09:00 JST) is allocated to the day's
+# highest-grade races first; the rest fall back to gpt-5.6-terra (small
+# pool). Reviews inherit the prediction state's recorded models.
+import tempfile as _tempfile
+from datetime import datetime as _dt
+
+check("pool: grade ranking orders graded races above class races",
+      o.grade_rank({"race": {"grade": "G1"}})
+      > o.grade_rank({"race": {"grade": "G2"}})
+      > o.grade_rank({"race": {"grade": "G3"}})
+      > o.grade_rank({"race": {"grade": "ロジータ記念重賞"}})
+      > o.grade_rank({"race": {"grade": "OP"}})
+      > o.grade_rank({"race": {"grade": "A"}})
+      > o.grade_rank({"race": {"grade": "B3"}})
+      > o.grade_rank({"race": {"grade": ""}}))
+check("pool: pool-day key flips at 09:00 JST",
+      o._pool_day_key_for(_dt.fromisoformat("2026-11-12T08:59+09:00"))
+      == "2026-11-11"
+      and o._pool_day_key_for(_dt.fromisoformat("2026-11-12T09:00+09:00"))
+      == "2026-11-12")
+
+_pool_tmp = Path(_tempfile.mkdtemp(prefix="pool-checks-"))
+_pool_usage = _pool_tmp / "usage.log"
+_pool_usage.write_text("\n".join([
+    # in-window flagship (astra): 60K + 40K
+    '{"ts": "2026-11-12T01:00:00+00:00", "provider": "openai", "model": "gpt-6-astra", "input_tokens": 50000, "output_tokens": 10000}',
+    '{"ts": "2026-11-12T10:30:00+09:00", "provider": "openai", "model": "gpt-6-astra", "input_tokens": 30000, "output_tokens": 10000}',
+    # in-window but small pool: excluded
+    '{"ts": "2026-11-12T11:00:00+09:00", "provider": "openai", "model": "gpt-5.6-terra", "input_tokens": 90000, "output_tokens": 90000}',
+    # previous pool day: excluded
+    '{"ts": "2026-11-11T08:00:00+09:00", "provider": "openai", "model": "gpt-6-astra", "input_tokens": 70000, "output_tokens": 70000}',
+    # other provider: excluded
+    '{"ts": "2026-11-12T11:00:00+09:00", "provider": "anthropic", "model": "claude-sonnet-5", "input_tokens": 70000, "output_tokens": 70000}',
+]) + "\n", encoding="utf-8")
+check("pool: flagship usage sums in-window non-small openai tokens only",
+      o.flagship_tokens_used("2026-11-12", _pool_usage) == 100_000)
+
+
+def _pool_fixture(stem_grade, start, field=14):
+    return {"race": {"race_id": f"rid-{stem_grade}", "grade": stem_grade,
+                     "date": "2026-11-12", "start_time": start,
+                     "field_size": field},
+            "horses": [{}] * field}
+
+
+_pool_items = [(f"race-{g}", _pool_fixture(g, t)) for g, t in
+               [("B3", "16:05"), ("G3", "15:40"), ("A", "18:00"),
+                ("OP", "20:10")]]
+_plans = o.create_pool_plan(_pool_items, runs_dir=_pool_tmp,
+                            usage_path=_pool_usage)
+_assign = {e["stem"]: e["assigned"] for e in _plans[0]["races"]}
+# budget = 250K - 100K used - 30K reserve = 120K; estimates 23.4K each,
+# grade order G3 > OP > A > B3 -> all four still fit (93.6K)
+check("pool: plan assigns astra in grade order while the budget lasts",
+      _assign == {"race-G3": "astra", "race-OP": "astra",
+                  "race-A": "astra", "race-B3": "astra"})
+with open(_pool_usage, "a", encoding="utf-8") as fh:
+    fh.write('{"ts": "2026-11-12T12:00:00+09:00", "provider": "openai", '
+             '"model": "gpt-6-astra", "input_tokens": 60000, '
+             '"output_tokens": 20000}\n')
+_plan2 = o.refresh_pool_plan(_plans[0], runs_dir=_pool_tmp,
+                             usage_path=_pool_usage)
+_assign2 = {e["stem"]: e["assigned"] for e in _plan2["races"]}
+# budget now 40K -> only the single highest grade keeps astra
+check("pool: refresh demotes the lowest grades first when usage grows",
+      _assign2 == {"race-G3": "astra", "race-OP": "terra",
+                   "race-A": "terra", "race-B3": "terra"})
+(_pool_tmp / "race-G3-state.json").write_text(
+    '{"models": {"chatgpt": "gpt-6-astra"}}', encoding="utf-8")
+(_pool_tmp / "race-OP-state.json").write_text(
+    '{"models": {"chatgpt": "gpt-5.6-terra"}}', encoding="utf-8")
+_plan3 = o.refresh_pool_plan(_plan2, runs_dir=_pool_tmp,
+                             usage_path=_pool_usage)
+_assign3 = {e["stem"]: e["assigned"] for e in _plan3["races"]}
+check("pool: started races keep the model their state recorded",
+      _assign3["race-G3"] == "astra" and _assign3["race-OP"] == "terra")
+
+_pool_built = _stub_built()
+_pool_info = {}
+_eff = o.apply_top_grade_models(
+    _pool_fixture("B3", "16:05"), _pool_built, live=True,
+    runs_dir=_pool_tmp, usage_path=_pool_usage, info_out=_pool_info)
+check("pool: live race in the plan runs its assigned model",
+      _eff["chatgpt"] == "gpt-5.6-terra" and _pool_info["source"] == "plan")
+_pool_built = _stub_built()
+_pool_info = {}
+_eff = o.apply_top_grade_models(
+    _pool_fixture("C", "12:00"), _pool_built, live=True,
+    runs_dir=_pool_tmp, usage_path=_pool_usage, info_out=_pool_info)
+check("pool: guard falls back to terra when no plan covers the race "
+      "and the remaining budget is under the threshold",
+      _eff["chatgpt"] == "gpt-5.6-terra" and _pool_info["source"] == "guard"
+      and _pool_info["remaining"] == 70_000)
+_rec_built = _stub_built()
+_eff = o.apply_top_grade_models(
+    _pool_fixture("A", "18:00"), _rec_built,
+    recorded={"chatgpt": "gpt-5.6-terra", "claude": "claude-sonnet-5",
+              "gemini": "gemini-3.1-pro-preview"})
+check("pool: review runs inherit the recorded prediction models",
+      _eff["chatgpt"] == "gpt-5.6-terra"
+      and _rec_built[0][1].model == "gpt-5.6-terra")
 
 print()
 if fails:

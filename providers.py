@@ -11,7 +11,7 @@ Key policy (Secure Vault connectors):
     OpenAI:    python3 ~/workspace/custom-connectors/custom.openai/bin/openai_api.py
                  chat --model M --system S --user U --max-tokens N
                (prints only the assistant reply text on stdout)
-               Default model: gpt-5-mini (verified working).
+               Default model: gpt-6-astra (verified working).
 
     Anthropic: same pattern under
                ~/workspace/custom-connectors/custom.anthropic/bin/
@@ -138,7 +138,11 @@ class OpenAIProvider(_HelperProvider):
     name = "openai"
     connector = "custom.openai"
     preferred_helper = "openai_api.py"
-    default_model = "gpt-5-mini"  # verified working via the connector
+    # Everyday default is the flagship itself since 2026-11-12 (user
+    # decision 2026-11-11): gpt-5-mini leaves the API on 2026-12-11, and
+    # the orchestrator's pool allocation falls back to gpt-5.6-terra on
+    # low-grade races when the flagship daily pool runs low.
+    default_model = "gpt-6-astra"  # verified working via the connector
     not_ready_hint = "Register the OpenAI key in the Secure Vault first."
 
 
