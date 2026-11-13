@@ -928,6 +928,39 @@ check("market: annotation shows market% next to own% and stays valid",
       "（市場" in _ann and o.prediction_errors(_ann, _bet_fx) == [])
 check("market: annotation is idempotent",
       o.annotate_market(_ann, _bet_fx) == _ann)
+
+# distorted snapshot: sentinel (999.9) odds on a material share of the
+# field — the 2026 QE Cup failure shape. The snapshot must degrade to
+# "missing" for every consumer, with the distortion kept on record.
+_field = list(_names)
+_n_sent = max(2, -(-len(_field) // 5))  # >= 2 and >= 20% of the field
+_dist_fx = _stamp_market(
+    _copy.deepcopy(monbetsu),
+    {**{n: 999.9 for n in _field[:_n_sent]},
+     **{n: 10.0 for n in _field[_n_sent:]}},
+)
+check("market distortion: sentinel-heavy snapshot is detected",
+      o.market_distortion(_dist_fx) is not None
+      and o.market_distortion(_bet_fx) is None
+      and o.market_distortion(monbetsu) is None)
+check("market distortion: snapshot degrades to missing everywhere",
+      o.fixture_market(_dist_fx) == {}
+      and o.market_ballot_marks(_dist_fx) is None
+      and "市場勝率" not in o.race_text(_dist_fx))
+_gate_dist = o.evaluate_conclusion_gate(_dist_fx, [{10: 40, 4: 20}])
+check("gate: distorted market passes, flagged apart from missing",
+      _gate_dist["decision"] == "pass"
+      and _gate_dist["market_missing"] is True
+      and _gate_dist["market_distorted"] is True
+      and "不完全" in _gate_dist["reason"])
+# a single sentinel runner stays usable (its de-vig weight is negligible)
+_one_sent_fx = _stamp_market(
+    _copy.deepcopy(monbetsu),
+    {**{n: 10.0 for n in _field}, _field[0]: 999.9},
+)
+check("market distortion: a single sentinel runner does not trip the guard",
+      o.market_distortion(_one_sent_fx) is None
+      and len(o.fixture_market(_one_sent_fx)) == len(_field))
 check("ballot probs: parsed from the final-ballot section",
       o.parse_ballot_probs(
           "議論。\n\n【最終票】\n◎ 10 タイムエッジ 勝率35%\n○ 4 ダムドローズ 勝率20%")

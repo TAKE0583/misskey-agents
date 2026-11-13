@@ -542,6 +542,7 @@ def race_text(fixture: dict, form_limit: int | None = None) -> str:
         "",
         "【出走馬】",
     ]
+    distorted = market_distortion(fixture) is not None
     for h in fixture["horses"]:
         recent = h["recent_form"][:form_limit] if form_limit else h["recent_form"]
         form = " / ".join(recent)
@@ -551,7 +552,7 @@ def race_text(fixture: dict, form_limit: int | None = None) -> str:
             f"{h['number']} {h['name']}（{bracket_part}{h['sex_age']}・{h['weight_kg']}kg・{h['jockey']}・{h['trainer']}厩舎）近走：{form}"
         )
         mkt = h.get("market") or {}
-        if mkt.get("win_prob") is not None:
+        if mkt.get("win_prob") is not None and not distorted:
             line += f" / 市場勝率{mkt['win_prob'] * 100:.1f}%（単勝{mkt.get('odds')}倍）"
         stats = person_stats_text(h)
         if stats:
@@ -690,10 +691,65 @@ def fair_odds(win_pct: int) -> float:
 # there are no odds, the block is nulls, and every consumer below must
 # degrade to the pre-market behaviour (no prompt note, no annotation,
 # no market ballot, no conclusion gate).
+#
+# A snapshot can also be DISTORTED rather than missing: the odds API
+# answers before the market has really formed and stamps unpriced
+# runners with its 999.9 sentinel odds. De-vigging normalises over
+# what is there, so the unpriced runners' probability mass lands on
+# the few priced ones — the 2026 QE Cup fixture (built Friday 19:00
+# for a Sunday G1) priced the field at 63.3% / 3.9% for the top two
+# while the real market was 23% / 12%, and every consumer downstream
+# (market ballot, gate, the moderator's narrative) trusted the
+# invented numbers. A distorted snapshot is worse than a missing one,
+# so when sentinel-priced runners make up a material share of the
+# field the snapshot degrades to "missing" for every consumer, with
+# the distortion kept on record (see the conclusion gate).
+
+MARKET_SENTINEL_ODDS = 999.0      # odds at/above this mean "not priced"
+MARKET_DISTORT_MIN_COUNT = 2      # at least this many sentinel runners …
+MARKET_DISTORT_MIN_RATIO = 0.15   # … and at least this share of the field
+
+
+def market_distortion(fixture: dict) -> dict | None:
+    """Distortion report for the fixture's market snapshot, or None
+    when the snapshot is usable. Absence of market data is NOT
+    distortion (that is the plain missing case): distortion needs
+    priced entries whose odds are the API's not-yet-priced sentinel
+    on a material share of the field."""
+    horses = fixture.get("horses") or []
+    field = len(horses)
+    if not field:
+        return None
+    priced = 0
+    sentinel = 0
+    for h in horses:
+        m = h.get("market") or {}
+        if m.get("win_prob") is None:
+            continue
+        priced += 1
+        odds = m.get("odds")
+        if odds is not None and float(odds) >= MARKET_SENTINEL_ODDS:
+            sentinel += 1
+    if not priced:
+        return None
+    if (sentinel >= MARKET_DISTORT_MIN_COUNT
+            and sentinel / field >= MARKET_DISTORT_MIN_RATIO):
+        return {
+            "sentinel_count": sentinel,
+            "field": field,
+            "priced": priced,
+            "ratio": round(sentinel / field, 3),
+        }
+    return None
+
 
 def fixture_market(fixture: dict) -> dict[int, dict]:
     """Usable market entries {number: {"odds":…, "win_prob":…}} — only
-    horses whose de-vigged probability is present."""
+    horses whose de-vigged probability is present. A distorted
+    snapshot (see market_distortion) yields no usable market at all,
+    so every consumer degrades exactly as for a missing one."""
+    if market_distortion(fixture) is not None:
+        return {}
     out: dict[int, dict] = {}
     for h in fixture.get("horses") or []:
         m = h.get("market") or {}
@@ -1922,7 +1978,10 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
                   2026-11-10, applied uniformly — including fixtures
                   built before betting opens, e.g. a Thursday-built
                   G1). "No data" stays distinguishable from "no edge"
-                  via the market_missing flag.
+                  via the market_missing flag. A distorted snapshot
+                  (see market_distortion) also lands here, flagged via
+                  market_distorted: its numbers exist but cannot be
+                  trusted, which is worse than no data.
     The anchor is the aggregate's top horse among those whose market
     probability is at least LONGSHOT_MIN_MARKET_PROB: a horse the
     market prices under that floor may top the panel's ranking but
@@ -1930,21 +1989,30 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
     `skipped_longshot` when it was the aggregate's top)."""
     names = {h["number"]: h["name"] for h in fixture["horses"]}
     market = fixture_market(fixture)
+    distortion = market_distortion(fixture)
     vector = build_probability_vector(contribs, fixture)
     record: dict = {
         "edge_margin": EDGE_MARGIN,
         "longshot_min_market_prob": LONGSHOT_MIN_MARKET_PROB,
         "market_missing": not market,
+        "market_distorted": distortion is not None,
         "aggregate_probs": {
             str(n): round(p, 2) for n, p in sorted(vector.items())
         },
         "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    if distortion is not None:
+        record["market_distortion"] = distortion
     if not market:
         record.update({
             "decision": "pass",
             "anchor": None,
-            "reason": "市場データがないため、市場を上回ることを検証できず見送り",
+            "reason": (
+                "市場データが不完全（未確定オッズが多数を占める）のため、"
+                "市場を上回ることを検証できず見送り"
+                if distortion is not None else
+                "市場データがないため、市場を上回ることを検証できず見送り"
+            ),
         })
         return record
     order = sorted(vector.items(), key=lambda kv: (-kv[1], kv[0]))
