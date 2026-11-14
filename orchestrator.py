@@ -568,7 +568,7 @@ def parse_marks(text: str) -> dict[str, tuple[int, str]]:
     return marks
 
 
-BET_SECTION_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?(.*)", re.S)
+BET_HEADING_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?")
 
 # --- Structured prediction path (local LLM) -------------------------------
 # Small local models collapse when asked for formatted prose. Instead the
@@ -1214,14 +1214,31 @@ def canonical_marks(text: str, fixture: dict) -> dict[str, tuple[int, str]]:
 
 
 def extract_bets(text: str, limit: int = 220) -> str:
-    """Pull the betting section (買い目) out of a prediction, if present."""
-    m = BET_SECTION_RE.search(text or "")
-    if not m:
-        return ""
-    section = m.group(1).strip()
-    # Drop trailing meta lines the models sometimes append after the bets.
-    section = re.split(r"\n\s*(?:以上|まとめ|総合判断)", section)[0].strip()
-    return section[:limit]
+    """Pull the betting section (買い目) out of a prediction, if present.
+
+    A prediction's prose can mention 買い目 before the real section
+    heading (the local renderer's rationale does), so the first
+    textual occurrence is not necessarily the section. Heading
+    candidates are tried in order and the first whose body parses as
+    bet lines wins; a clean-but-empty body is next best. When no
+    candidate parses, the first candidate is returned unchanged so
+    upstream validators report the same errors as before (the
+    error-feedback retry depends on them)."""
+    text = text or ""
+    first = ""
+    first_clean = ""
+    for m in BET_HEADING_RE.finditer(text):
+        section = text[m.end():].strip()
+        # Drop trailing meta lines the models sometimes append after the bets.
+        section = re.split(r"\n\s*(?:以上|まとめ|総合判断)", section)[0].strip()
+        if not first:
+            first = section
+        bets, errors = parse_bet_lines(section)
+        if bets and not errors:
+            return section[:limit]
+        if not errors and not first_clean:
+            first_clean = section
+    return (first_clean or first)[:limit]
 
 
 # --- Run state, locking, identity ------------------------------------------

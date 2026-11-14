@@ -966,6 +966,24 @@ check("ballot probs: parsed from the final-ballot section",
           "議論。\n\n【最終票】\n◎ 10 タイムエッジ 勝率35%\n○ 4 ダムドローズ 勝率20%")
       == {10: 35, 4: 20})
 
+# extract_bets: a prose mention of 買い目 before the real heading (the
+# 2026-11-14 Kyoto 11R abort: the local renderer's rationale mentions
+# 買い目 in prose) must not be mistaken for the section.
+_prose_bets = (
+    "買い目については市場の歪みを考慮した。買い目は以下の通り。\n"
+    "◎ 10 タイムエッジ 勝率35% 3着内60% — 理由。\n\n"
+    "【買い目】\n単勝 10 1000点\n3連複 4-10 500点"
+)
+_ext = o.extract_bets(_prose_bets, limit=100000)
+check("extract_bets: prose mention before the heading is skipped",
+      _ext.startswith("単勝 10") and o.parse_bet_lines(_ext)[1] == [])
+check("extract_bets: plain heading still extracted",
+      o.extract_bets("【買い目】\n単勝 10 1000点", limit=100000)
+      == "単勝 10 1000点")
+check("extract_bets: unparsable section falls back for error reporting",
+      o.extract_bets("【買い目】\nこれは買い目ではない", limit=100000)
+      == "これは買い目ではない")
+
 _vec = o.build_probability_vector([{10: 40, 4: 20}], _bet_fx)
 check("vector: full-field, sums to 100, residual follows the market",
       abs(sum(_vec.values()) - 100.0) < 1e-6
