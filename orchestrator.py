@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import providers  # noqa: E402
 import points as points_mod  # noqa: E402
+import reflection_memory as memory_mod  # noqa: E402
 from misskey_client import MisskeyClient, fetch_tokens  # noqa: E402
 
 MC_USERNAME = "shikai"
@@ -1073,11 +1074,13 @@ def budget_line(cap: int | None) -> str:
 
 
 def generate_structured_prediction(prov, fixture: dict,
-                                   cap: int | None = None) -> str:
+                                   cap: int | None = None,
+                                   memory: str = "") -> str:
     body = race_text(fixture, form_limit=3)
     user = (
         f"次のレースの予想をしてください。\n\n{body}"
         + market_prompt_note(fixture)
+        + memory
         + budget_line(cap)
     )
     obj = _structured_with_retry(
@@ -1567,7 +1570,7 @@ class _StageFailure(RuntimeError):
 
 
 def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
-                              cap: int | None) -> str:
+                              cap: int | None, memory: str = "") -> str:
     """One cloud persona's free-text prediction, fully validated, with
     the standard one error-feedback retry. Raises RuntimeError when the
     retry still fails validation."""
@@ -1575,6 +1578,7 @@ def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
     system = SYSTEM_TEMPLATE.format(display=persona["display"])
     user = f"次のレースの予想をしてください。\n\n{body}"
     user += market_prompt_note(fixture)
+    user += memory
     user += budget_line(cap)
     text = prov.chat(system, user)
     errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
@@ -2081,7 +2085,8 @@ def evaluate_conclusion_gate(fixture: dict, contribs: list[dict]) -> dict:
 
 def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                                cache: dict | None = None, save=None,
-                               points: dict | None = None) -> dict:
+                               points: dict | None = None,
+                               memory: dict | None = None) -> dict:
     """Generate every text (predictions, debate, final ballots, conclusion)
     before anything is posted.
 
@@ -2097,6 +2102,13 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     (and persisted via `save()`) as soon as they are produced, so a
     failure mid-generation never re-bills the steps that already
     succeeded — a re-run reuses them and generates only what is missing.
+
+    Reflection memory (2026-11-16): `memory` maps a username to a digest
+    of that AI's OWN past reflections, resolved by the caller
+    (run_prediction) from the reflection-memory store. The digest is
+    appended to that AI's prediction prompt only — never to the debate
+    prompt, and never to another AI's prompt. Accounts absent from the
+    map predict exactly as before.
     """
     if cache is None:
         cache = {"predictions": {}, "debate": {}, "final_marks": {},
@@ -2174,14 +2186,20 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
         cap = None
         if points and username in points:
             cap = points[username]["cap"]
+        mem = (memory or {}).get(username, "")
+        if mem:
+            print(
+                f"[reflection memory injected for {username}]",
+                file=sys.stderr,
+            )
         try:
             if persona.get("structured") and hasattr(prov, "chat_json"):
                 text = generate_structured_prediction(
-                    prov, fixture, cap=cap
+                    prov, fixture, cap=cap, memory=mem
                 )
             else:
                 text = _generate_text_prediction(
-                    prov, persona, fixture, body, cap
+                    prov, persona, fixture, body, cap, memory=mem
                 )
         except Exception as exc:  # noqa: BLE001 - exclusion, not abort
             _exclude(persona, "prediction", f"{type(exc).__name__}: {exc}")
@@ -2491,13 +2509,20 @@ def run_prediction(fixture: dict, emitter: Emitter, built, store: RunState,
         ledger = points_mod.PointsLedger(points_mod.ledger_path(emitter.live))
         usernames = [p["username"] for p, _ in built] + [MC_USERNAME]
         snap = ledger.snapshot(usernames)
+        # Reflection memory snapshot (2026-11-16): each predictor's own
+        # recent reflections, resolved here like the points snapshot;
+        # generation only consumes the map. The MC never predicts and
+        # is not included.
+        memory = memory_mod.blocks_for(
+            [p["username"] for p, _ in built], live=emitter.live
+        )
         cache = d.setdefault(
             "gen", {"predictions": {}, "debate": {}, "final_marks": {},
                     "final_probs": {}}
         )
         generated = _generate_prediction_texts(
             fixture, built, mc_provider=mc_provider,
-            cache=cache, save=store.save, points=snap,
+            cache=cache, save=store.save, points=snap, memory=memory,
         )
         d.update(generated)
         d["points"] = {
@@ -3212,6 +3237,31 @@ def run_review(
             entry["error"] = "generation: empty response"
             failures.append(username)
         store.save()
+
+    # Reflection memory (2026-11-16): record every generated reflection
+    # into the per-AI memory store, so that AI's future prediction
+    # prompts can carry its own recent lessons. Idempotent per race, so
+    # a resumed review simply re-records the same entries. Recording
+    # must never break a review, hence the guard (the same policy as
+    # the A/B measurement above).
+    try:
+        r = fixture["race"]
+        venue = str(r.get("venue") or "").replace("競馬場", "")
+        label = f"{venue}{r.get('race_number')}R {r.get('name')}".strip()
+        for persona, _prov in participants:
+            username = persona["username"]
+            entry = ledger.get(username, {})
+            if entry.get("text"):
+                memory_mod.record(
+                    username,
+                    state.get("race_id"),
+                    r.get("date"),
+                    label,
+                    entry["text"],
+                    live=emitter.live,
+                )
+    except Exception as e:  # noqa: BLE001 - memory is an enhancement
+        print(f"[reflection memory record failed: {e}]", file=sys.stderr)
 
     # Post the review note itself.
     if not review.get("note_id"):
