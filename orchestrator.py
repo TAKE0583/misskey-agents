@@ -90,7 +90,7 @@ MARK_SCORE = {"◎": 4, "○": 3, "▲": 2, "△": 1}
 TOP_GRADE_MODELS = {
     "chatgpt": "gpt-6-astra",      # OpenAI flagship ($10/$50 per MTok)
     "claude": "claude-fable-5-2",  # Anthropic flagship ($8/$40 per MTok; 5.2 since 2026-11-10, user decision)
-    "gemini": "gemini-4-argon",    # Google flagship ($2/$10 per MTok at introductory pricing through 2026-11-30, doubles 2026-12-01; user decision 2026-11-11, access + format verified live the same day)
+    "gemini": "gemini-4-carbon",   # Google top tier (per-token price identical to Argon: $2/$10 per MTok introductory through 2026-11-30, doubles to $4/$20 on 2026-12-01; user decision 2026-11-18 after a cost check against the Argon usage baseline, access verified live the same day; Argon until 2026-11-17)
 }
 _TOP_GRADE_KEYS = {"G1", "JPN1", "JG1"}  # JG1: jump G1 (Nakayama Grand Jump)
 _GRADE_TRANSLATE = str.maketrans({"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3"})
