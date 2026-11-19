@@ -38,7 +38,7 @@ from pathlib import Path
 # predicted on terra is also reflected on with terra.
 TOP_GRADE_MODELS = {
     "chatgpt": "gpt-6-astra",      # OpenAI flagship ($10/$50 per MTok)
-    "claude": "claude-fable-5-2",  # Anthropic flagship ($8/$40 per MTok; 5.2 since 2026-11-10, user decision)
+    "claude": "claude-fable-5-2",  # Anthropic flagship ($8/$40 per MTok; 5.2 since 2026-11-10, user decision); the everyday default is also Fable since 2026-11-19, so this entry is now a no-op safeguard
     "gemini": "gemini-4-neon",   # Google efficiency tier released 2026-11-18 ($3/$15 per MTok regular pricing). User decision 2026-11-19 after a live eval (tests/neon_eval.py): all 6 calls passed validation with zero format errors, ~2-4x faster and cheaper than Carbon, which intermittently returned empty first responses and needed a 2x-budget retry. Carbon was used 2026-11-18 only; Argon 2026-11-11 to 11-17.
 }
 _TOP_GRADE_KEYS = {"G1", "JPN1", "JG1"}  # JG1: jump G1 (Nakayama Grand Jump)

@@ -150,7 +150,7 @@ class AnthropicProvider(_HelperProvider):
     name = "anthropic"
     connector = "custom.anthropic-alt"  # alt key since 2026-11-19 (user decision; the original custom.anthropic org is nearly out of credit). Helper verified live 2026-11-19 for claude-sonnet-5 and claude-fable-5-2.
     preferred_helper = "anthropic_api.py"
-    default_model = "claude-sonnet-5"  # verified working via the connector
+    default_model = "claude-fable-5-2"  # flagship for ALL races since 2026-11-19 (user decision; the alt org budget is $100/month). claude-sonnet-5 was the everyday default until 2026-11-18.
     not_ready_hint = (
         "Anthropic key is not in the Secure Vault yet; once registered, a "
         "helper will appear under custom.anthropic-alt/bin/ and this provider "

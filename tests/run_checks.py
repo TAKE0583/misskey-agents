@@ -889,8 +889,8 @@ _built_norm = [(p, p["provider"]()) for p in o.PERSONAS]
 _eff_norm = o.apply_top_grade_models({"race": {"grade": "G2"}}, _built_norm)
 check("top grade: ordinary grades keep the default models",
       _eff_norm == {"chatgpt": "gpt-6-astra",
-                    "claude": "claude-sonnet-5",
-                    "gemini": "gemini-3.1-pro-preview"}
+                     "claude": "claude-fable-5-2",
+                     "gemini": "gemini-3.1-pro-preview"}
       and _built_norm[0][1].model == "gpt-6-astra")
 
 import copy as _copy
