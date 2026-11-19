@@ -14,7 +14,7 @@ Key policy (Secure Vault connectors):
                Default model: gpt-6-astra (verified working).
 
     Anthropic: same pattern under
-               ~/workspace/custom-connectors/custom.anthropic/bin/
+               ~/workspace/custom-connectors/custom.anthropic-alt/bin/
                (not registered yet -> raises ProviderNotConfigured)
     Gemini:    same pattern under
                ~/workspace/custom-connectors/custom.google-gemini/bin/
@@ -148,12 +148,12 @@ class OpenAIProvider(_HelperProvider):
 
 class AnthropicProvider(_HelperProvider):
     name = "anthropic"
-    connector = "custom.anthropic"
+    connector = "custom.anthropic-alt"  # alt key since 2026-11-19 (user decision; the original custom.anthropic org is nearly out of credit). Helper verified live 2026-11-19 for claude-sonnet-5 and claude-fable-5-2.
     preferred_helper = "anthropic_api.py"
     default_model = "claude-sonnet-5"  # verified working via the connector
     not_ready_hint = (
         "Anthropic key is not in the Secure Vault yet; once registered, a "
-        "helper will appear under custom.anthropic/bin/ and this provider "
+        "helper will appear under custom.anthropic-alt/bin/ and this provider "
         "will work with the same chat interface."
     )
 
