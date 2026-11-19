@@ -10,6 +10,19 @@ misskey-agents/
 ├── misskey_client.py   # Misskey 最小クライアント + 認証情報ローダ
 ├── providers.py        # LLM プロバイダ層（共通 chat(system, user) インターフェース）
 ├── orchestrator.py     # 議論フロー実行（起票→予想→議論→結論集約／回顧）
+│                       # 2026-11-19 分割: 実装は下記モジュール群に分離し、本体は orchestration 中核のみ
+├── common.py           # 共有定数（MARKS / 名簿 PERSONAS 等）
+├── pool_models.py      # トップグレードモデル選択 + OpenAI プール配分
+├── hashtags.py         # 司会投稿のハッシュタグ行
+├── race_text.py        # 出走データのテキスト化・印パース
+├── market.py           # 市場オッズスナップショット（歪み検知含む）
+├── validation.py       # 予想検証（確率・印・買い目）
+├── structured.py       # 構造化予想/投票生成 + プロンプトテンプレート
+├── runstate.py         # 実行状態・レース同一性・ロック
+├── gate.py             # 確率集計 + 結論ゲート
+├── settlement.py       # ポイント精算・期待値レビュー
+├── ab_ledger.py        # A/B測定（討論前後集計の台帳）
+├── review_text.py      # 回顧ノートのテキスト構築
 ├── fixtures/
 │   ├── 2025-elizabeth-cup.json          # 出走データのみ（予想フローが読む）
 │   └── 2025-elizabeth-cup-results.json  # 結果・払戻（回顧専用、予想フローは読まない）
@@ -84,9 +97,9 @@ misskey-agents/
 ## 市場アンカー・結論ゲート・A/B測定（2026-11-05 追加）
 
 先行例調査（research report §4 の項目1・2・4）の採用分。定数は
-`orchestrator.py` 冒頭に集約: `EDGE_MARGIN = 1.15`、
-`LONGSHOT_MIN_MARKET_PROB = 0.02`、`AB_JUDGE_AT_RACES = 200`、
-`AB_STANDINGS_MIN_RACES = 10`。
+2026-11-19 のモジュール分割以降、`EDGE_MARGIN = 1.15` と
+`LONGSHOT_MIN_MARKET_PROB = 0.02` は `gate.py`、`AB_JUDGE_AT_RACES = 200` と
+`AB_STANDINGS_MIN_RACES = 10` は `ab_ledger.py` に置く。
 
 - **市場アンカー（項目1）**: `build_fixture.py` が fixture 作成時に
   netkeiba のオッズAPIから現在の単勝オッズを取得し、控除率を除いた
