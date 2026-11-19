@@ -1,0 +1,222 @@
+{
+  "generated_at": "2026-11-19T10:54:33+0900",
+  "models": [
+    "gemini-4-neon",
+    "gemini-4-carbon",
+    "gemini-3.1-pro-preview"
+  ],
+  "fixtures": [
+    "fixtures/2026-oi-1118-11r.json",
+    "fixtures/2026-kasamatsu-1118-12r.json"
+  ],
+  "persona": {
+    "username": "gemini",
+    "display": "Gemini"
+  },
+  "chat_budget_max_tokens": 6000,
+  "validation_max_total": 3000,
+  "reflection_memory_chars": 1544,
+  "price_per_mtok_usd": {
+    "gemini-4-neon": [
+      3.0,
+      15.0
+    ],
+    "gemini-4-carbon": [
+      2.0,
+      10.0
+    ]
+  },
+  "price_note": "gemini-4-carbon becomes (4.0, 20.0) USD per 1M tokens on 2026-12-01; models without a price entry are reported as n/a.",
+  "prompts": {
+    "2026-oi-1118-11r": {
+      "system_sha256": "e2974caf51f7adc1cd8d795dacb55eb2628c53138e9fca52498e646289542cb1",
+      "user_sha256": "713300204fc46bbc520038cfadec12c333350fc85b33b1fdfc08db0d4d0cd9d6",
+      "user_chars": 7310,
+      "cap": 3000
+    },
+    "2026-kasamatsu-1118-12r": {
+      "system_sha256": "e2974caf51f7adc1cd8d795dacb55eb2628c53138e9fca52498e646289542cb1",
+      "user_sha256": "519ac9bee05327889b9acd40de6f2cdb2203f6eb6a8668b9599d923484c9d571",
+      "user_chars": 8387,
+      "cap": 3000
+    }
+  },
+  "rows": [
+    {
+      "fixture": "fixtures/2026-oi-1118-11r.json",
+      "fixture_stem": "2026-oi-1118-11r",
+      "model": "gemini-4-neon",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 88.00692003099994,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:49:05+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-neon",
+          "input_tokens": 6238,
+          "output_tokens": 707
+        }
+      ],
+      "input_tokens": 6238,
+      "output_tokens": 707,
+      "cost_usd": 0.029319,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 78,
+      "output_file": "tests/neon_eval_out/2026-oi-1118-11r__gemini-4-neon.txt",
+      "exception": null
+    },
+    {
+      "fixture": "fixtures/2026-oi-1118-11r.json",
+      "fixture_stem": "2026-oi-1118-11r",
+      "model": "gemini-4-carbon",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 131.71467473600023,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:50:17+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-carbon",
+          "input_tokens": 6238,
+          "output_tokens": 3
+        },
+        {
+          "ts": "2026-11-19T10:51:17+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-carbon",
+          "input_tokens": 6238,
+          "output_tokens": 626
+        }
+      ],
+      "input_tokens": 12476,
+      "output_tokens": 629,
+      "cost_usd": 0.031242,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 76,
+      "output_file": "tests/neon_eval_out/2026-oi-1118-11r__gemini-4-carbon.txt",
+      "exception": null
+    },
+    {
+      "fixture": "fixtures/2026-oi-1118-11r.json",
+      "fixture_stem": "2026-oi-1118-11r",
+      "model": "gemini-3.1-pro-preview",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 22.114360440999917,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:51:39+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-3.1-pro-preview",
+          "input_tokens": 6274,
+          "output_tokens": 590
+        }
+      ],
+      "input_tokens": 6274,
+      "output_tokens": 590,
+      "cost_usd": null,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 78,
+      "output_file": "tests/neon_eval_out/2026-oi-1118-11r__gemini-3.1-pro-preview.txt",
+      "exception": null
+    },
+    {
+      "fixture": "fixtures/2026-kasamatsu-1118-12r.json",
+      "fixture_stem": "2026-kasamatsu-1118-12r",
+      "model": "gemini-4-neon",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 32.81363072299973,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:52:12+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-neon",
+          "input_tokens": 7015,
+          "output_tokens": 656
+        }
+      ],
+      "input_tokens": 7015,
+      "output_tokens": 656,
+      "cost_usd": 0.030885,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 69,
+      "output_file": "tests/neon_eval_out/2026-kasamatsu-1118-12r__gemini-4-neon.txt",
+      "exception": null
+    },
+    {
+      "fixture": "fixtures/2026-kasamatsu-1118-12r.json",
+      "fixture_stem": "2026-kasamatsu-1118-12r",
+      "model": "gemini-4-carbon",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 119.86262932699992,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:53:21+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-carbon",
+          "input_tokens": 7015,
+          "output_tokens": 3
+        },
+        {
+          "ts": "2026-11-19T10:54:11+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-4-carbon",
+          "input_tokens": 7015,
+          "output_tokens": 738
+        }
+      ],
+      "input_tokens": 14030,
+      "output_tokens": 741,
+      "cost_usd": 0.03547,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 65,
+      "output_file": "tests/neon_eval_out/2026-kasamatsu-1118-12r__gemini-4-carbon.txt",
+      "exception": null
+    },
+    {
+      "fixture": "fixtures/2026-kasamatsu-1118-12r.json",
+      "fixture_stem": "2026-kasamatsu-1118-12r",
+      "model": "gemini-3.1-pro-preview",
+      "runner_count": 12,
+      "cap": 3000,
+      "status": "PASS",
+      "seconds": 21.913195120000637,
+      "usage_lines": [
+        {
+          "ts": "2026-11-19T10:54:33+09:00",
+          "provider": "google-gemini",
+          "model": "gemini-3.1-pro-preview",
+          "input_tokens": 7048,
+          "output_tokens": 558
+        }
+      ],
+      "input_tokens": 7048,
+      "output_tokens": 558,
+      "cost_usd": null,
+      "errors": [],
+      "error_count": 0,
+      "with_probabilities": 4,
+      "win_probability_sum": 77,
+      "output_file": "tests/neon_eval_out/2026-kasamatsu-1118-12r__gemini-3.1-pro-preview.txt",
+      "exception": null
+    }
+  ]
+}
