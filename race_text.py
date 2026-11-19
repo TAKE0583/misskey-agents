@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from market import market_distortion
 MARK_RE = re.compile(r"([◎○▲△])\s*(?:馬番)?\s*(\d{1,2})\s*番?\s+([ァ-ヶー・]+)")
 
 def person_stats_text(horse: dict) -> str:
@@ -72,8 +73,3 @@ def parse_marks(text: str) -> dict[str, tuple[int, str]]:
     for mark, num, name in MARK_RE.findall(text or ""):
         marks.setdefault(mark, (int(num), name))
     return marks
-
-
-def market_distortion(fixture: dict) -> dict | None:
-    import orchestrator
-    return orchestrator.market_distortion(fixture)
