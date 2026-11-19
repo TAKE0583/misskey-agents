@@ -43,6 +43,11 @@ import providers  # noqa: E402
 import points as points_mod  # noqa: E402
 import reflection_memory as memory_mod  # noqa: E402
 from misskey_client import MisskeyClient, fetch_tokens  # noqa: E402
+from hashtags import (  # noqa: E402
+    PROJECT_TAG, _TAG_ANNOTATION, _TAG_BRACKETED, _TAG_INVALID,
+    _tag_fragment, hashtag_line, race_hashtag, venue_hashtag,
+)
+from race_text import MARK_RE, parse_marks, person_stats_text, race_text  # noqa: E402
 
 MC_USERNAME = "shikai"
 PERSONAS = [
@@ -395,93 +400,6 @@ LONGSHOT_MIN_MARKET_PROB = 0.02  # anchor needs at least this market prob
 MARKET_USERNAME = "market"       # pseudo-voter carrying the market ballot
 AB_JUDGE_AT_RACES = 200          # the debate default is judged at this count
 AB_STANDINGS_MIN_RACES = 10      # review notes show A/B standings from here
-MARK_RE = re.compile(r"([◎○▲△])\s*(?:馬番)?\s*(\d{1,2})\s*番?\s+([ァ-ヶー・]+)")
-
-# --- Hashtags on the moderator's posts (2026-11-05) ----------------------
-# Every @shikai note (thread opener, conclusion, review) ends with one
-# hashtag line so any post of a race's thread identifies the race:
-#   #AI競馬予想 #門別競馬場 #2026道営記念
-# The line is derived deterministically from the fixture alone, so the
-# three notes of one race always carry the identical line. Texts of
-# already-posted notes live in the run state and are never regenerated,
-# so adding tags here cannot disturb reconciliation of older runs; only
-# newly generated @shikai texts gain the line.
-PROJECT_TAG = "#AI競馬予想"
-
-# Bracketed grade/class badges the netkeiba scrapes glue onto race
-# names (道営記念〔H1〕重賞, カムイユカラスプリント(A2)). A bracketed
-# segment is dropped whole only when its entire content is one of these
-# annotations; any other parenthetical (天皇賞(秋)) is part of the race
-# name and its content survives (the bracket characters themselves are
-# removed by the character filter below).
-_TAG_ANNOTATION = re.compile(
-    r"(?:G[123]|Jpn[ⅠⅡⅢI123]|H[123]|[A-C][123]|OP|L|重賞|条件|新馬|未勝利)"
-)
-_TAG_BRACKETED = re.compile(
-    r"〔([^〕]*)〕|（([^）]*)）|\(([^)]*)\)|［([^］]*)］|\[([^\]]*)\]"
-)
-# Characters allowed in a Misskey hashtag fragment: kana/kanji (with
-# iteration marks and the long-vowel mark), ASCII letters/digits and
-# underscore. Everything else — whitespace, brackets, symbols and the
-# katakana middle dot ・ — is stripped: MFM hashtag parsing stops at
-# characters like ・, so keeping one would silently truncate the tag.
-_TAG_INVALID = re.compile(r"[^0-9A-Za-z_ぁ-んァ-ヶー一-龯々〆]")
-
-
-def _tag_fragment(raw: str) -> str:
-    """Sanitise a race name into a hashtag-safe fragment.
-
-    Rules: drop bracketed grade/class annotations (brackets AND
-    content); keep the content of other bracketed segments; an opening
-    bracket that never closes is scrape glue — drop it and everything
-    after it; remove all whitespace; drop a trailing 重賞 descriptor the
-    NAR scrape glues on (道営記念〔H1〕重賞 -> 道営記念); finally strip
-    every character invalid in a Misskey hashtag (see _TAG_INVALID).
-    """
-    def _sub(m: re.Match) -> str:
-        content = next(g for g in m.groups() if g is not None)
-        if _TAG_ANNOTATION.fullmatch(content.strip()):
-            return ""
-        return content
-
-    s = _TAG_BRACKETED.sub(_sub, raw or "")
-    unmatched = re.search(r"[〔（(［\[]", s)
-    if unmatched:
-        s = s[: unmatched.start()]
-    s = re.sub(r"\s+", "", s)
-    if s.endswith("重賞") and len(s) > 2:
-        s = s[:-2]
-    return _TAG_INVALID.sub("", s)
-
-
-def race_hashtag(fixture: dict) -> str | None:
-    """'#2026道営記念' from the fixture's race name + date year."""
-    r = fixture.get("race") or {}
-    name = _tag_fragment(str(r.get("name") or ""))
-    if not name:
-        return None
-    year = re.search(r"\d{4}", str(r.get("date") or ""))
-    return f"#{year.group(0)}{name}" if year else f"#{name}"
-
-
-def venue_hashtag(fixture: dict) -> str | None:
-    """'#門別競馬場' from the fixture's venue ('門別競馬場' -> same tag)."""
-    r = fixture.get("race") or {}
-    venue = re.sub(r"\s+", "", str(r.get("venue") or ""))
-    if not venue:
-        return None
-    base = venue[:-3] if venue.endswith("競馬場") else venue
-    base = _TAG_INVALID.sub("", base)
-    return f"#{base}競馬場" if base else None
-
-
-def hashtag_line(fixture: dict) -> str:
-    """The final line of every @shikai note: project, venue, race tags."""
-    tags = [PROJECT_TAG]
-    for tag in (venue_hashtag(fixture), race_hashtag(fixture)):
-        if tag:
-            tags.append(tag)
-    return " ".join(tags)
 
 SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、他のAIと議論して最終的に一つの結論に収束させる場に参加しています。
 予想は特定の観点に偏らず、過去の走破内容・騎手・枠順・馬場状態・脚質と想定ペース・近走の勢いを総合的に判断してください。
@@ -498,75 +416,6 @@ SYSTEM_TEMPLATE = """あなたは {display} です。競馬予想AIとして、�
 単勝 7 500
 3連複 1-7-11 500
 全体で800字程度に収めてください。"""
-
-
-def person_stats_text(horse: dict) -> str:
-    """Compact jockey/trainer season record for one runner line, e.g.
-    '騎手（地方・今季）勝率12.8% 連対21.9% 複勝34.0% / 調教師（地方・今季）…'.
-    The stats come from the fixture's jockey_stats / trainer_stats
-    (db.netkeiba season tables for the race's own jurisdiction;
-    career=True renders 通算 instead of 今季）. A person without
-    stats contributes nothing, and a runner with neither renders the
-    empty string, leaving the line exactly as it was before the
-    fixture carried stats."""
-    parts = []
-    for key, label in (("jockey_stats", "騎手"), ("trainer_stats", "調教師")):
-        st = horse.get(key)
-        if not st:
-            continue
-        span = "通算" if st.get("career") else "今季"
-        parts.append(
-            f"{label}（{st['scope']}・{span}）"
-            f"勝率{st['win_rate']:.1f}% 連対{st['top2_rate']:.1f}% "
-            f"複勝{st['top3_rate']:.1f}%"
-        )
-    return " / ".join(parts)
-
-
-def race_text(fixture: dict, form_limit: int | None = None) -> str:
-    r = fixture["race"]
-    # Bracket and weather have always been in the fixture but were not
-    # rendered into the prompt until 2026-11-10 (the prompts ask the
-    # AIs to weigh 枠順, so the data has to actually reach them). The
-    # .get guards keep older fixtures rendering as before.
-    header = (
-        f"{r['date']} {r['venue']} {r['race_number']}R / {r['course']} "
-        f"{r['distance_m']}m / 馬場：{r['going']}"
-    )
-    weather = str(r.get("weather") or "").strip()
-    if weather:
-        header += f" / 天候：{weather}"
-    header += f" / {r['conditions']} / {r['field_size']}頭立て"
-    lines = [
-        f"第{r['edition']}回 {r['name']}（{r['grade']}）",
-        header,
-        "",
-        "【出走馬】",
-    ]
-    distorted = market_distortion(fixture) is not None
-    for h in fixture["horses"]:
-        recent = h["recent_form"][:form_limit] if form_limit else h["recent_form"]
-        form = " / ".join(recent)
-        bracket = h.get("bracket")
-        bracket_part = f"{bracket}枠・" if bracket else ""
-        line = (
-            f"{h['number']} {h['name']}（{bracket_part}{h['sex_age']}・{h['weight_kg']}kg・{h['jockey']}・{h['trainer']}厩舎）近走：{form}"
-        )
-        mkt = h.get("market") or {}
-        if mkt.get("win_prob") is not None and not distorted:
-            line += f" / 市場勝率{mkt['win_prob'] * 100:.1f}%（単勝{mkt.get('odds')}倍）"
-        stats = person_stats_text(h)
-        if stats:
-            line += f" / {stats}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def parse_marks(text: str) -> dict[str, tuple[int, str]]:
-    marks: dict[str, tuple[int, str]] = {}
-    for mark, num, name in MARK_RE.findall(text or ""):
-        marks.setdefault(mark, (int(num), name))
-    return marks
 
 
 BET_HEADING_RE = re.compile(r"【?買い目[^\n】]*】?\s*\n?")
