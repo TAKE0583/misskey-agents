@@ -253,20 +253,46 @@ def _generate_text_prediction(prov, persona: dict, fixture: dict, body: str,
     errors = prediction_errors(text, fixture, max_total=cap) if text.strip() else ["出力が空でした"]
     if errors:
         print(f"[prediction retry for {username}: {errors}]", file=sys.stderr)
-        retry = prov.chat(
-            system,
-            user
-            + "\n\n【重要】前回の出力に次の問題がありました: "
-            + " / ".join(errors)
-            + "\nすべて直して、印4つ（◎○▲△、すべて異なる実在の馬、各印に勝率と3着内率）と"
-            "【買い目】（券種ごとの頭数を守り、金額は100単位・上限以内）"
-            "を含む完全な予想を出し直してください。",
-        )
+        # Patch-style retry when the first output has content: repeat the
+        # model's own output back to it and have it repair only the
+        # flagged lines, keeping its picks and bet amounts. Models that
+        # repeat a format mistake on a fresh regeneration (Gemini dropping
+        # 勝率/3着内率 from the mark lines) keep their judgment and just
+        # fix the format. An empty first output has nothing to patch, so
+        # it keeps the regeneration-style prompt.
+        if text.strip():
+            retry_prompt = (
+                user
+                + "\n\n前回のあなたの出力に次の問題がありました: "
+                + " / ".join(errors)
+                + "\n前回のあなたの出力は以下の通りです。"
+                "その判断内容（印・買い目の選択と金額）は変えず、"
+                "問題のある箇所だけを直した、完全な全文を返してください。"
+                "確率推定は各印の行に『勝率X% 3着内Y%』の形で必ず含めてください。"
+                "修正についての説明・前置き・謝罪は書かないでください。"
+                + "\n\n--- 前回の出力 ---\n"
+                + text
+            )
+        else:
+            retry_prompt = (
+                user
+                + "\n\n【重要】前回の出力に次の問題がありました: "
+                + " / ".join(errors)
+                + "\nすべて直して、印4つ（◎○▲△、すべて異なる実在の馬、各印に勝率と3着内率）と"
+                "【買い目】（券種ごとの頭数を守り、金額は100単位・上限以内）"
+                "を含む完全な予想を出し直してください。"
+            )
+        retry = prov.chat(system, retry_prompt)
         errors = prediction_errors(retry, fixture, max_total=cap) if retry.strip() else ["再生成の出力が空でした"]
         if errors:
-            raise RuntimeError(
+            exc = RuntimeError(
                 f"prediction from {username} failed validation after retry: {errors}"
             )
+            exc.failed_outputs = [
+                {"attempt": 1, "text": text},
+                {"attempt": 2, "text": retry},
+            ]
+            raise exc
         text = retry
     return text
 
@@ -674,18 +700,19 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
     active: list = list(built)
     excluded: list[dict] = []
 
-    def _exclude(persona, stage: str, reason: str) -> None:
+    def _exclude(persona, stage: str, reason: str, failed_outputs=None) -> None:
         username = persona["username"]
         active[:] = [p for p in active if p[0]["username"] != username]
-        excluded.append(
-            {
-                "username": username,
-                "display": persona["display"],
-                "stage": stage,
-                "reason": reason,
-                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            }
-        )
+        entry = {
+            "username": username,
+            "display": persona["display"],
+            "stage": stage,
+            "reason": reason,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if failed_outputs is not None:
+            entry["failed_outputs"] = failed_outputs
+        excluded.append(entry)
         print(f"[excluded {username} at {stage}: {reason}]", file=sys.stderr)
         if not active or (len(active) < 2 and len(built) >= 2):
             raise RuntimeError(
@@ -721,7 +748,12 @@ def _generate_prediction_texts(fixture: dict, built, mc_provider=None,
                     prov, persona, fixture, body, cap, memory=mem
                 )
         except Exception as exc:  # noqa: BLE001 - exclusion, not abort
-            _exclude(persona, "prediction", f"{type(exc).__name__}: {exc}")
+            _exclude(
+                persona,
+                "prediction",
+                f"{type(exc).__name__}: {exc}",
+                failed_outputs=getattr(exc, "failed_outputs", None),
+            )
             continue
         # Posted texts show the market win% next to the AI's own
         # estimates for its marked horses (deterministic annotation).

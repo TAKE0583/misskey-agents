@@ -81,6 +81,38 @@ check("prediction: valid text passes", o.prediction_errors(text_ok, monbetsu) ==
 text_99 = text_ok.replace("10 タイムエッジ", "99 ゴースト").replace("単勝 10", "単勝 99").replace("1-4-10", "1-4-99")
 check("prediction: #99 everywhere rejected", o.prediction_errors(text_99, monbetsu) != [])
 
+
+class _PatchRetryProv:
+    name = "patchretry"
+
+    def __init__(self, first, second):
+        self.users: list[str] = []
+        self._outputs = [first, second]
+
+    def chat(self, system, user, model=None, max_tokens=None):
+        self.users.append(user)
+        return self._outputs.pop(0)
+
+
+text_no_probs = (
+    "◎ 10 タイムエッジ — 本命。\n○ 4 ダムドローズ — 対抗。\n"
+    "▲ 1 エリオラ — 単穴。\n△ 2 ラップドアップ — 連下。\n\n"
+    "【買い目】\n単勝 10 400点\n3連複 1-4-10 600点"
+)
+_patch_prov = _PatchRetryProv(text_no_probs, text_ok)
+_patch_out = o._generate_text_prediction(
+    _patch_prov, {"username": "gemini", "display": "Gemini"}, monbetsu,
+    o.race_text(monbetsu), None,
+)
+check(
+    "prediction: patch retry repairs a no-probability output",
+    o.prediction_errors(text_no_probs, monbetsu) != []
+    and _patch_out == text_ok
+    and len(_patch_prov.users) == 2
+    and text_no_probs in _patch_prov.users[1]
+    and "--- 前回の出力 ---" in _patch_prov.users[1],
+)
+
 # --- MockProvider: distinct picks + ballot (finding 11) ---
 for n in (5, 8, 12, 16, 18):
     horses = [(i + 1, "テスト") for i in range(n)]
