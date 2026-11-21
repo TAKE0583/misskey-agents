@@ -683,6 +683,12 @@ def build_fixture(
         cfg = ScrapingConfig()
     scraper = EntryPageScraper(race_id, cfg)
     entry = scraper.get_entry()
+    # Scratched/excluded runners remain in the entry table (flagged via
+    # 出走区分) but must not reach a prediction fixture: the field is
+    # the horses that will actually run. (2026-11-16: Mizusawa 11R had
+    # a pre-build scratch.)
+    if "出走区分" in entry.columns:
+        entry = entry[entry["出走区分"] == "出走"].reset_index(drop=True)
     if nar:
         info = nar_race_info(scraper.soup, race_id, len(entry))
     else:
