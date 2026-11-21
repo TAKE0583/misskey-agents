@@ -52,6 +52,14 @@ check("race decode: ascii round trip",
       build_fixture._decode_race_html(ascii_snippet.encode("ascii"))
       == ascii_snippet)
 
+# --- db-page decode (UTF-8 fix, 2026-11-21) -----------------------------
+db_snippet = "年度 東京 ルメール db_h_race_results"
+check("db decode: utf-8 round trip",
+      build_fixture._decode_db_html(db_snippet.encode("utf-8")) == db_snippet)
+check("db decode: euc-jp round trip",
+      build_fixture._decode_db_html(db_snippet.encode("euc-jp"))
+      == db_snippet)
+
 # --- career parse ------------------------------------------------------
 rows = build_fixture.parse_horse_career(CAREER_HTML)
 check("career: 2 rows", len(rows) == 2, f"got {len(rows)}")

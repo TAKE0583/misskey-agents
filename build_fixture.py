@@ -360,14 +360,12 @@ def parse_person_page(html: str, year: int) -> dict[str, dict | None]:
 
 
 def _decode_db_html(content: bytes) -> str:
-    """db.netkeiba.com serves EUC-JP; fall back to UTF-8 if the
-    年度 marker is missing (page format change)."""
-    text = content.decode("euc-jp", errors="replace")
-    if "年度" not in text:
-        alt = content.decode("utf-8", errors="replace")
-        if "年度" in alt:
-            text = alt
-    return text
+    """db.netkeiba.com serves UTF-8; keep EUC-JP as a fallback
+    candidate and keep whichever decode has fewer U+FFFD
+    replacement chars (ties: UTF-8)."""
+    utf = content.decode("utf-8", errors="replace")
+    euc = content.decode("euc-jp", errors="replace")
+    return utf if utf.count("\ufffd") <= euc.count("\ufffd") else euc
 
 
 def _decode_race_html(content: bytes) -> str:
@@ -573,12 +571,7 @@ def fetch_horse_career(horse_id: str) -> list[dict] | None:
     except Exception:  # noqa: BLE001 - career data is optional input
         return None
     time.sleep(0.3)  # keep fetches polite, as with profile pages
-    text = resp.content.decode("euc-jp", errors="replace")
-    if "db_h_race_results" not in text:
-        alt = resp.content.decode("utf-8", errors="replace")
-        if "db_h_race_results" in alt:
-            text = alt
-    return parse_horse_career(text)
+    return parse_horse_career(_decode_db_html(resp.content))
 
 
 def _db_form_for_horses(race: dict, horses: list[dict]) -> dict[int, list[str]]:
