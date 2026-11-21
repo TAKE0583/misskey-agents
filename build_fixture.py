@@ -102,7 +102,7 @@ def fetch_recent_form(race_id: str, nar: bool = False) -> dict[int, list[str]]:
     url = f"{host}/race/shutuba_past.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    html = resp.content.decode("utf-8", errors="replace")
+    html = _decode_race_html(resp.content)
     tables = pd.read_html(io.StringIO(html))
     main = tables[0]
     form: dict[int, list[str]] = {}
@@ -368,6 +368,19 @@ def _decode_db_html(content: bytes) -> str:
         if "年度" in alt:
             text = alt
     return text
+
+
+def _decode_race_html(content: bytes) -> str:
+    """race.netkeiba.com / nar.netkeiba.com pages are EUC-JP. Decode
+    both ways and keep the candidate that contains the race-page
+    marker 馬 and has fewer U+FFFD replacement chars (ties: EUC-JP)."""
+    euc = content.decode("euc-jp", errors="replace")
+    utf = content.decode("utf-8", errors="replace")
+
+    def score(t):
+        return (0 if "馬" in t else 1, t.count("\ufffd"))
+
+    return euc if score(euc) <= score(utf) else utf
 
 
 def fetch_person_page_stats(
@@ -802,7 +815,7 @@ def nar_finish(race_id: str) -> list[dict]:
     url = f"{NAR_RACE_URL}/race/result.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    html = resp.content.decode("utf-8", errors="replace")
+    html = _decode_race_html(resp.content)
     table = pd.read_html(io.StringIO(html))[0]
     table = table.rename(columns=lambda c: str(c).replace(" ", ""))
     finish = []

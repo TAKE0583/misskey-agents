@@ -66,7 +66,7 @@ def discover(date_iso: str, nar: bool) -> list[str]:
         headers=build_fixture.HEADERS, timeout=30,
     )
     resp.raise_for_status()
-    html = resp.content.decode("utf-8", errors="replace")
+    html = build_fixture._decode_race_html(resp.content)
     ids = sorted(set(re.findall(r"race_id=(\d{12})", html)))
     if nar:
         mains: dict[str, str] = {}
@@ -95,7 +95,7 @@ def _results_fixture(race_id: str, date_iso: str, nar: bool) -> dict:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(
-            resp.content.decode("utf-8", errors="replace"), "html.parser"
+            build_fixture._decode_race_html(resp.content), "html.parser"
         )
         el = soup.find(class_="RaceName")
         if el is not None:

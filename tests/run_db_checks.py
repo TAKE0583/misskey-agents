@@ -41,6 +41,17 @@ check("id_str: none", build_fixture._id_str(None) is None)
 check("nar id: saga", racing_db._is_nar_race_id("202655110811") is True)
 check("nar id: jra tokyo", racing_db._is_nar_race_id("202605050211") is False)
 
+# --- race-page decode (EUC-JP fix, 2026-11-21) -------------------------
+snippet = "馬番 着順 タイム 単勝オッズ"
+check("race decode: euc-jp round trip",
+      build_fixture._decode_race_html(snippet.encode("euc-jp")) == snippet)
+check("race decode: utf-8 round trip",
+      build_fixture._decode_race_html(snippet.encode("utf-8")) == snippet)
+ascii_snippet = "race_id=202611210711 <html> 1st 2nd 10.5"
+check("race decode: ascii round trip",
+      build_fixture._decode_race_html(ascii_snippet.encode("ascii"))
+      == ascii_snippet)
+
 # --- career parse ------------------------------------------------------
 rows = build_fixture.parse_horse_career(CAREER_HTML)
 check("career: 2 rows", len(rows) == 2, f"got {len(rows)}")
